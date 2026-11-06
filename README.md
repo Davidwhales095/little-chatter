@@ -2,38 +2,46 @@
 
 A short-range messenger for older Android smartphones.
 
-`little chatter` is a lightweight Bluetooth Classic chat app designed for legacy Android devices. It targets Android 4.4.1 through Android 6.0.1 and focuses on direct, nearby messaging without internet access, servers, or modern Android-only frameworks.
+`little chatter` is a lightweight Bluetooth Classic chat app designed for legacy Android devices. It runs on Android 4.4.x (KitKat) only and focuses on direct, nearby messaging without internet access, servers, or modern Android-only frameworks.
 
 ## Features
 
-- Short-range peer-to-peer messaging over Bluetooth Classic RFCOMM/SPP
-- Supports Android 4.4.1-6.0.1/API 19-23
-- Separate Bluetooth scan and chat screens
-- Automatically opens the chat screen when a peer connects
-- Automatically returns to the scan screen when the connection is lost
-- Clears the chat window when returning to the scan screen
-- Keeps the screen awake while the chat screen is active
-- Blocks additional connection attempts while already connected
-- Optional BLE scan helper for nearby BLE advertisers on supported devices
+- Time-limited group rooms for up to 6 people nearby (1 host + 5 members), over Bluetooth Classic RFCOMM
+- The host picks a time limit (10 / 30 / 60 minutes); the room deletes itself when time is up
+- Nearby rooms are listed automatically; tapping one sends a join request
+- The host accepts or declines each request, seeing the requester's nickname, Bluetooth name, last four address digits and phone model
+- Rooms are strict: if anyone leaves, the room is deleted for everyone, and everyone is told who left
+- Unexpected disconnects get a 45-second reconnect window; if the person does not come back in time, the room is deleted
+- Messages are kept in memory only and disappear with the room
+- Keeps running while the app is minimized or the screen is off (foreground service with an ongoing notification)
+- Android 4.4.x (KitKat, API 19) only; other versions show an "unsupported" screen
 
 ## How To Use
 
-1. Install the app on two Android devices.
-2. Enable Bluetooth on both devices.
-3. Open the app. It starts on the `Bluetooth Scan` screen.
-4. On one device, tap `Listen`.
-5. If needed, tap `Discoverable` so the other device can find it.
-6. On the other device, tap `Scan Classic`.
-7. Select a discovered or paired device, then tap `Connect`.
-8. Once connected, the app automatically switches to the `Chat` screen.
-9. If the connection is lost or disconnected, the app returns to `Bluetooth Scan`.
+1. Install the app on every device and enable Bluetooth.
+2. **Host:** pick a time limit and tap `Create`. Allow the "make discoverable" prompt.
+3. **Members:** tap `Find rooms` (about 12 seconds of scanning, then each device is checked), then tap a room.
+4. The member's screen shows their device name, address ending and model. The host gets a `Join request` popup with the same details, compares them, and taps `Accept` or `Decline`.
+5. Chat. The room screen shows the time left and who is in the room.
+6. `Leave` asks for confirmation, because leaving deletes the room for everyone. Back only minimizes the app.
+
+## How Rooms Work
+
+- **Topology:** every member connects to the host; the host relays messages and sets each sender's name (members cannot impersonate each other).
+- **Finding rooms:** after discovery, the app briefly connects to each device found (and paired devices) on the room service UUID. Devices that are not hosting fail within a few seconds; hosts reply with the host's nickname, head count and time left.
+- **Join approval:** the requester's Bluetooth name is read by the host's own Bluetooth stack (the requester's app cannot fake it, though the phone's owner can rename the phone); the address ending cannot be changed on ordinary phones. Requests are shown one at a time. A declined device is blocked for the rest of the room; a request with no answer for 60 seconds is declined automatically, without blocking.
+- **Reconnecting:** when the host accepts, it gives the member a private token. After an unexpected disconnect, the member reconnects with that token (only from the same device, no new approval) within 45 seconds and receives the messages it missed.
+- **Timers:** the host's clock is the only clock. It sends the remaining time to members every 15 seconds; the same messages act as heartbeats, and a link silent for 40 seconds counts as disconnected.
+- **Room ends when:** time is up, anyone taps `Leave`, or someone does not reconnect within 45 seconds.
 
 ## Notes
 
 - Messages use Bluetooth Classic, not BLE.
-- BLE scanning is only a helper for discovering nearby BLE advertisers.
+- Messages are not encrypted at the app level; host approval controls who can join.
+- Rooms use protocol version 2 and a new service UUID, so they do not talk to older 1:1 builds.
 - Android 4.4 does not support BLE advertising/peripheral APIs, so BLE mesh messaging is not implemented.
 - Bluetooth pairing prompts may appear depending on the device and manufacturer.
+- `maxSdkVersion` only filters app stores; Android itself does not block sideloaded installs on newer versions, so the app also checks the version at startup.
 - This project is intended for direct APK installation and legacy device testing, not modern Play Store distribution requirements.
 
 ## Package
@@ -41,5 +49,6 @@ A short-range messenger for older Android smartphones.
 - Application ID: `com.messenger.little`
 - App name: `little chatter`
 - Minimum SDK: `19`
-- Target SDK: `23`
+- Target SDK: `19`
+- Maximum SDK: `19`
 
