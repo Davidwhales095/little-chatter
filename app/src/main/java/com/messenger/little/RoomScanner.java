@@ -1,6 +1,7 @@
 package com.messenger.little;
 
 import android.bluetooth.BluetoothAdapter;
+import android.bluetooth.BluetoothClass;
 import android.bluetooth.BluetoothDevice;
 import android.bluetooth.BluetoothSocket;
 import android.os.SystemClock;
@@ -59,6 +60,27 @@ final class RoomScanner {
                     + minutes + " min left\n"
                     + deviceName + "  (" + RoomProtocol.addressTail(device.getAddress()) + ")";
         }
+    }
+
+    /** Bluetooth "Computer / Tablet" device class (0x011C); Android 4.4 has no constant for it. */
+    private static final int DEVICE_COMPUTER_TABLET = 0x011C;
+
+    /**
+     * Only smartphones and tablets can host a room, so only they are probed. Headsets,
+     * speakers, cars, laptops, desktops and devices with an unknown class are skipped.
+     * Tablets that report themselves as handheld or tablet computers count as tablets.
+     */
+    static boolean isPhoneOrTablet(BluetoothClass bluetoothClass) {
+        if (bluetoothClass == null) {
+            return false;
+        }
+        if (bluetoothClass.getMajorDeviceClass() == BluetoothClass.Device.Major.PHONE) {
+            return true;
+        }
+        int deviceClass = bluetoothClass.getDeviceClass();
+        return deviceClass == BluetoothClass.Device.COMPUTER_HANDHELD_PC_PDA
+                || deviceClass == BluetoothClass.Device.COMPUTER_PALM_SIZE_PC_PDA
+                || deviceClass == DEVICE_COMPUTER_TABLET;
     }
 
     /** Per-device limit for connecting and reading the room description. */

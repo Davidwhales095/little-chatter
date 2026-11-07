@@ -3,6 +3,7 @@ package com.messenger.little;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.bluetooth.BluetoothAdapter;
+import android.bluetooth.BluetoothClass;
 import android.bluetooth.BluetoothDevice;
 import android.content.BroadcastReceiver;
 import android.content.ComponentName;
@@ -34,10 +35,12 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 
 public final class MainActivity extends Activity implements ChatService.UiListener, RoomScanner.Callback {
     private static final int REQUEST_ENABLE_BLUETOOTH = 3001;
@@ -49,6 +52,8 @@ public final class MainActivity extends Activity implements ChatService.UiListen
     private final Handler handler = new Handler();
     /** Devices seen during the current "Find rooms" scan, by address. */
     private final Map<String, BluetoothDevice> discovered = new LinkedHashMap<String, BluetoothDevice>();
+    /** Addresses of non-phone/tablet devices seen and skipped during the current scan. */
+    private final Set<String> skipped = new HashSet<String>();
     private final List<RoomScanner.FoundRoom> rooms = new ArrayList<RoomScanner.FoundRoom>();
 
     private BluetoothAdapter bluetoothAdapter;
@@ -116,8 +121,9 @@ public final class MainActivity extends Activity implements ChatService.UiListen
             if (BluetoothDevice.ACTION_FOUND.equals(action)) {
                 BluetoothDevice device = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
                 if (device != null && findingRooms) {
-                    discovered.put(device.getAddress(), device);
-                    setStatus("Looking for nearby devices... (" + discovered.size() + " found)");
+                    BluetoothClass bluetoothClass = intent.getParcelableExtra(BluetoothDevice.EXTRA_CLASS);
+                    addCandidate(device, bluetoothClass != null ? bluetoothClass : device.getBluetoothClass());
+                    setStatus("Looking for nearby phones and tablets... (" + discovered.size() + " found)");
                 }
             } else if (BluetoothAdapter.ACTION_DISCOVERY_FINISHED.equals(action)) {
                 if (findingRooms && scanner == null) {
@@ -310,9 +316,10 @@ public final class MainActivity extends Activity implements ChatService.UiListen
         rooms.clear();
         roomAdapter.notifyDataSetChanged();
         discovered.clear();
-        // Paired phones are checked too, in case the host is no longer discoverable.
+        skipped.clear();
+        // Paired phones and tablets are checked too, in case the host is no longer discoverable.
         for (BluetoothDevice device : bluetoothAdapter.getBondedDevices()) {
-            discovered.put(device.getAddress(), device);
+            addCandidate(device, device.getBluetoothClass());
         }
         findingRooms = true;
         findButton.setText("Stop");
@@ -332,9 +339,21 @@ public final class MainActivity extends Activity implements ChatService.UiListen
             onScanFinished(0, false);
             return;
         }
-        setStatus("Checking " + discovered.size() + " devices for rooms...");
+        setStatus("Checking " + discovered.size() + " phones/tablets for rooms"
+                + (skipped.isEmpty() ? "" : " (skipped " + skipped.size() + " other devices)") + "...");
         scanner = new RoomScanner(bluetoothAdapter, this);
         scanner.start(new ArrayList<BluetoothDevice>(discovered.values()));
+    }
+
+    /** Keeps smartphones and tablets for the room check; other kinds of devices are skipped. */
+    private void addCandidate(BluetoothDevice device, BluetoothClass bluetoothClass) {
+        String address = device.getAddress();
+        if (RoomScanner.isPhoneOrTablet(bluetoothClass)) {
+            discovered.put(address, device);
+            skipped.remove(address);
+        } else if (!discovered.containsKey(address)) {
+            skipped.add(address);
+        }
     }
 
     private void stopFindingRooms() {
