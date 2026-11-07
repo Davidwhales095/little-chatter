@@ -1,19 +1,25 @@
 package com.messenger.little;
 
-import android.Manifest;
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.bluetooth.BluetoothAdapter;
+import android.bluetooth.BluetoothClass;
 import android.bluetooth.BluetoothDevice;
 import android.content.BroadcastReceiver;
+import android.content.ComponentName;
 import android.content.Context;
+import android.content.DialogInterface;
 import android.content.Intent;
 import android.content.IntentFilter;
-import android.content.pm.PackageManager;
+import android.content.ServiceConnection;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
+import android.os.IBinder;
+import android.os.SystemClock;
+import android.text.InputFilter;
 import android.view.Gravity;
 import android.view.View;
 import android.view.WindowManager;
@@ -21,82 +27,822 @@ import android.widget.AdapterView;
 import android.widget.ArrayAdapter;
 import android.widget.Button;
 import android.widget.EditText;
+import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.ListView;
+import android.widget.RadioButton;
+import android.widget.RadioGroup;
 import android.widget.ScrollView;
 import android.widget.TextView;
 
 import java.util.ArrayList;
-import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedList;
 import java.util.List;
-import java.util.Map;
+import java.util.Locale;
+import java.util.Set;
 
-public final class MainActivity extends Activity implements BluetoothClassicMeshService.Listener {
+public final class MainActivity extends Activity implements ChatService.UiListener {
     private static final int REQUEST_ENABLE_BLUETOOTH = 3001;
-    private static final int REQUEST_RUNTIME_PERMISSIONS = 3002;
-    private static final int DISCOVERABLE_SECONDS = 300;
-    private static final long BLE_SCAN_MILLIS = 10000L;
+    /** Android 4.4 allows at most one hour of discoverability per request. */
+    private static final int MAX_DISCOVERABLE_SECONDS = 3600;
+    private static final int[] ROOM_MINUTES = {10, 30, 60};
+    private static final int DEFAULT_ROOM_MINUTES_INDEX = 1;
+    /** "Find rooms" stops after this long, even if discovery keeps finding devices. */
+    private static final long FIND_ROOMS_MS = 30000L;
+    private static final int MAX_SCAN_LOG_LINES = 8;
 
     private final Handler handler = new Handler();
-    private final Map<String, DeviceRow> devicesByKey = new HashMap<String, DeviceRow>();
-    private final List<DeviceRow> devices = new ArrayList<DeviceRow>();
+    /** Addresses already handled (checked, queued or skipped) in the current "Find rooms" scan. */
+    private final Set<String> seenAddresses = new HashSet<String>();
+    /** Phones and tablets found but not checked yet, in the order they were found. */
+    private final LinkedList<BluetoothDevice> probeQueue = new LinkedList<BluetoothDevice>();
+    /** Per-device results of the current scan, newest last, shown under the room list. */
+    private final LinkedList<String> scanLog = new LinkedList<String>();
+    private final List<RoomScanner.FoundRoom> rooms = new ArrayList<RoomScanner.FoundRoom>();
 
     private BluetoothAdapter bluetoothAdapter;
-    private BluetoothClassicMeshService meshService;
-    private ArrayAdapter<DeviceRow> deviceAdapter;
-    private DeviceRow selectedDevice;
-    private boolean bleScanning = false;
-    private int connectedPeerCount = 0;
+    private ChatService chatService;
+    private boolean serviceBound = false;
+    private boolean uiVisible = false;
+    private RoomState shownState = RoomState.IDLE;
+    private ArrayAdapter<RoomScanner.FoundRoom> roomAdapter;
+    private boolean findingRooms = false;
+    /** A device is being checked right now (discovery is paused meanwhile). */
+    private boolean probing = false;
+    /** Discovery was cancelled by us for a check, so its "finished" event is not the end of a round. */
+    private boolean pausedForProbe = false;
+    private boolean pairedQueued = false;
+    /** Incremented per scan so results from a stopped scan are ignored. */
+    private int scanSession = 0;
+    private long findDeadline;
+    private RoomScanner scanner;
+    private AlertDialog openDialog;
+    private AlertDialog requestDialog;
+    private String shownRequestId;
+    /** The request the host just answered; ignored until the room confirms it is handled. */
+    private String answeredRequestId;
+    /** Set when the user leaves or cancels on purpose, so no "room is gone" dialog is shown. */
+    private boolean closingByUser = false;
 
-    private LinearLayout scanScreen;
-    private LinearLayout chatScreen;
+    private LinearLayout lobbyScreen;
+    private LinearLayout waitingScreen;
+    private LinearLayout roomScreen;
     private TextView statusText;
-    private TextView peerText;
     private TextView localDeviceText;
+    private EditText nicknameInput;
+    private RadioGroup durationGroup;
+    private Button findButton;
+    private TextView scanLogText;
+    private TextView waitingTitleText;
+    private TextView waitingStateText;
+    private TextView waitingDeviceText;
+    private TextView roomTitleText;
+    private TextView timeLeftText;
+    private Button peopleButton;
+    // Side panel with the room's members and the Leave button.
+    private FrameLayout contentFrame;
+    private View sidebarScrim;
+    private LinearLayout sidebar;
+    private int sidebarWidth;
+    private boolean sidebarOpen = false;
+    private TextView sidebarTitleText;
+    private TextView sidebarTimeText;
+    private TextView sidebarCountText;
+    private LinearLayout sidebarMembers;
     private LinearLayout messagesContainer;
     private ScrollView messagesScroll;
-    private EditText nicknameInput;
     private EditText messageInput;
+    private Button sendButton;
 
-    private final BroadcastReceiver classicDiscoveryReceiver = new BroadcastReceiver() {
+    private final ServiceConnection serviceConnection = new ServiceConnection() {
         @Override
-        public void onReceive(Context context, Intent intent) {
-            String action = intent.getAction();
-            if (BluetoothAdapter.ACTION_DISCOVERY_STARTED.equals(action)) {
-                setStatus("Classic discovery started.");
-            } else if (BluetoothAdapter.ACTION_DISCOVERY_FINISHED.equals(action)) {
-                setStatus("Classic discovery finished.");
-            } else if (BluetoothDevice.ACTION_FOUND.equals(action)) {
-                BluetoothDevice device = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
-                short rssi = intent.getShortExtra(BluetoothDevice.EXTRA_RSSI, Short.MIN_VALUE);
-                addDevice(device, "classic", rssi);
+        public void onServiceConnected(ComponentName name, IBinder binder) {
+            chatService = ((ChatService.LocalBinder) binder).getService();
+            chatService.setUiListener(MainActivity.this);
+            chatService.setUiVisible(uiVisible);
+            restoreFromService();
+        }
+
+        @Override
+        public void onServiceDisconnected(ComponentName name) {
+            chatService = null;
+        }
+    };
+
+    private final Runnable findTimeout = new Runnable() {
+        @Override
+        public void run() {
+            // A check in progress finishes first; probeNext() then sees the deadline.
+            if (findingRooms && !probing) {
+                finishFindingRooms();
             }
         }
     };
 
-    private final BluetoothAdapter.LeScanCallback leScanCallback = new BluetoothAdapter.LeScanCallback() {
+    private final Runnable countdownTick = new Runnable() {
         @Override
-        public void onLeScan(final BluetoothDevice device, final int rssi, byte[] scanRecord) {
-            runOnUiThread(new Runnable() {
-                @Override
-                public void run() {
-                    addDevice(device, "ble-scan", rssi);
-                }
-            });
+        public void run() {
+            updateTimeLeft();
+            handler.postDelayed(this, 1000L);
         }
     };
+
+    private final BroadcastReceiver discoveryReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            String action = intent.getAction();
+            if (BluetoothDevice.ACTION_FOUND.equals(action)) {
+                BluetoothDevice device = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
+                if (device != null && findingRooms) {
+                    BluetoothClass bluetoothClass = intent.getParcelableExtra(BluetoothDevice.EXTRA_CLASS);
+                    onDeviceFound(device, bluetoothClass != null ? bluetoothClass : device.getBluetoothClass());
+                }
+            } else if (BluetoothAdapter.ACTION_DISCOVERY_FINISHED.equals(action)) {
+                if (!findingRooms) {
+                    return;
+                }
+                if (pausedForProbe) {
+                    pausedForProbe = false; // We paused it for a check; it resumes afterwards.
+                    return;
+                }
+                onDiscoveryRoundFinished();
+            }
+        }
+    };
+
+    // ---- Lifecycle ------------------------------------------------------------------------------
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
-        bluetoothAdapter = BluetoothAdapter.getDefaultAdapter();
-        meshService = new BluetoothClassicMeshService(bluetoothAdapter, this);
+        if (!isSupportedAndroidVersion()) {
+            setContentView(buildUnsupportedView());
+            return;
+        }
 
+        bluetoothAdapter = BluetoothAdapter.getDefaultAdapter();
         setContentView(buildContentView());
-        registerClassicDiscoveryReceiver();
+        IntentFilter filter = new IntentFilter();
+        filter.addAction(BluetoothDevice.ACTION_FOUND);
+        filter.addAction(BluetoothAdapter.ACTION_DISCOVERY_FINISHED);
+        registerReceiver(discoveryReceiver, filter);
         refreshLocalDeviceInfo();
-        refreshPairedDevices();
+
+        // The room lives in ChatService so it survives minimizing the app.
+        serviceBound = bindService(new Intent(this, ChatService.class), serviceConnection, BIND_AUTO_CREATE);
+    }
+
+    @Override
+    protected void onStart() {
+        super.onStart();
+        uiVisible = true;
+        if (chatService != null) {
+            chatService.setUiVisible(true);
+            showUnseenClosedReason();
+        }
+    }
+
+    @Override
+    protected void onStop() {
+        uiVisible = false;
+        if (chatService != null) {
+            chatService.setUiVisible(false);
+        }
+        super.onStop();
+    }
+
+    @Override
+    public void onBackPressed() {
+        if (sidebarOpen) {
+            closeSidebar(true);
+            return;
+        }
+        // While in (or joining) a room, Back only minimizes; the room keeps running in ChatService.
+        if (chatService != null && chatService.hasRoom()) {
+            moveTaskToBack(true);
+            return;
+        }
+        super.onBackPressed();
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == REQUEST_ENABLE_BLUETOOTH) {
+            refreshLocalDeviceInfo();
+            setStatus(resultCode == RESULT_OK ? "Bluetooth enabled." : "Bluetooth was not enabled.");
+        }
+    }
+
+    @Override
+    protected void onDestroy() {
+        if (!serviceBound) {
+            // Unsupported Android version: nothing was started.
+            super.onDestroy();
+            return;
+        }
+        handler.removeCallbacks(countdownTick);
+        dismissDialog();
+        dismissRequestDialog();
+        stopFindingRooms();
+        try {
+            unregisterReceiver(discoveryReceiver);
+        } catch (Exception ignored) {
+        }
+        getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        if (chatService != null) {
+            // A room (if any) keeps running in the service; reopening the app shows it again.
+            chatService.setUiListener(null);
+        }
+        unbindService(serviceConnection);
+        serviceBound = false;
+        chatService = null;
+        super.onDestroy();
+    }
+
+    /** little chatter is maintained for Android 4.4.x (KitKat, API 19) only. */
+    static boolean isSupportedAndroidVersion() {
+        return Build.VERSION.SDK_INT == Build.VERSION_CODES.KITKAT;
+    }
+
+    // ---- ChatService.UiListener (main thread) ----------------------------------------------
+
+    @Override
+    public void onStatus(String message) {
+        setStatus(message);
+    }
+
+    @Override
+    public void onRoomStateChanged(RoomState state) {
+        render(state, false);
+    }
+
+    @Override
+    public void onChatEntry(ChatService.ChatEntry entry) {
+        if (roomScreen.getVisibility() == View.VISIBLE) {
+            appendEntry(entry);
+        }
+    }
+
+    @Override
+    public void onRoomClosed(String reason) {
+        boolean wasInRoom = shownState.inRoom();
+        render(RoomState.IDLE, false);
+        if (closingByUser) {
+            closingByUser = false;
+            return;
+        }
+        showClosedDialog(wasInRoom ? "The room is gone" : "Could not join", reason);
+    }
+
+    // ---- Actions --------------------------------------------------------------------------------
+
+    private void createRoom() {
+        if (!ensureBluetoothReady() || !ensureService()) {
+            return;
+        }
+        if (chatService.hasRoom()) {
+            setStatus("You are already in a room.");
+            return;
+        }
+        int minutes = selectedRoomMinutes();
+        stopFindingRooms();
+        chatService.createRoom(nickname(), minutes);
+        // Let people nearby find this phone for as long as the room lasts (up to an hour).
+        Intent intent = new Intent(BluetoothAdapter.ACTION_REQUEST_DISCOVERABLE);
+        intent.putExtra(BluetoothAdapter.EXTRA_DISCOVERABLE_DURATION, Math.min(minutes * 60, MAX_DISCOVERABLE_SECONDS));
+        startActivity(intent);
+    }
+
+    // "Find rooms": phones and tablets are checked as soon as discovery finds them. Discovery
+    // pauses during each check (connecting while discovering is unreliable on Android 4.4) and
+    // resumes afterwards, so rooms show up in the list while the scan is still running.
+
+    private void toggleFindRooms() {
+        if (findingRooms) {
+            stopFindingRooms();
+            setStatus("Stopped looking for rooms.");
+            return;
+        }
+        if (!ensureBluetoothReady()) {
+            return;
+        }
+        rooms.clear();
+        roomAdapter.notifyDataSetChanged();
+        probeQueue.clear();
+        seenAddresses.clear();
+        scanLog.clear();
+        renderScanLog();
+        scanSession++;
+        probing = false;
+        pausedForProbe = false;
+        pairedQueued = false;
+        findingRooms = true;
+        findDeadline = SystemClock.elapsedRealtime() + FIND_ROOMS_MS;
+        handler.removeCallbacks(findTimeout);
+        handler.postDelayed(findTimeout, FIND_ROOMS_MS);
+        findButton.setText("Stop");
+        resumeDiscovery();
+    }
+
+    private void onDeviceFound(BluetoothDevice device, BluetoothClass bluetoothClass) {
+        if (!seenAddresses.add(device.getAddress())) {
+            return;
+        }
+        if (!RoomScanner.isPhoneOrTablet(bluetoothClass)) {
+            log(label(device) + ": skipped, not a phone/tablet (" + RoomScanner.describeClass(bluetoothClass) + ")");
+            return;
+        }
+        probeQueue.addLast(device);
+        probeNext();
+    }
+
+    /** Checks the next queued device, or resumes discovery when nothing is queued. */
+    private void probeNext() {
+        if (!findingRooms || probing) {
+            return;
+        }
+        if (SystemClock.elapsedRealtime() >= findDeadline) {
+            finishFindingRooms();
+            return;
+        }
+        BluetoothDevice device = probeQueue.pollFirst();
+        if (device == null) {
+            resumeDiscovery();
+            return;
+        }
+        probing = true;
+        if (bluetoothAdapter.isDiscovering()) {
+            pausedForProbe = true;
+            bluetoothAdapter.cancelDiscovery();
+        }
+        setStatus("Checking " + label(device) + " for a room...");
+        final int session = scanSession;
+        scanner = new RoomScanner();
+        scanner.probe(device, new RoomScanner.ProbeCallback() {
+            @Override
+            public void onProbeResult(final BluetoothDevice checked, final RoomScanner.FoundRoom room,
+                                      final String detail) {
+                runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        onProbeDone(session, checked, room, detail);
+                    }
+                });
+            }
+        });
+    }
+
+    private void onProbeDone(int session, BluetoothDevice device, RoomScanner.FoundRoom room, String detail) {
+        if (session != scanSession) {
+            return; // Result of a scan that was stopped.
+        }
+        probing = false;
+        scanner = null;
+        log(label(device) + ": " + detail);
+        if (room != null) {
+            rooms.add(room);
+            roomAdapter.notifyDataSetChanged();
+        }
+        probeNext();
+    }
+
+    private void resumeDiscovery() {
+        if (!findingRooms || probing || bluetoothAdapter.isDiscovering()) {
+            return;
+        }
+        if (SystemClock.elapsedRealtime() >= findDeadline) {
+            finishFindingRooms();
+            return;
+        }
+        if (bluetoothAdapter.startDiscovery()) {
+            setStatus("Looking for nearby phones and tablets... (" + rooms.size()
+                    + (rooms.size() == 1 ? " room" : " rooms") + " so far)");
+        } else {
+            onDiscoveryRoundFinished();
+        }
+    }
+
+    /** A full discovery round ended without new phones or tablets to check. */
+    private void onDiscoveryRoundFinished() {
+        if (probing) {
+            return;
+        }
+        if (!pairedQueued) {
+            // Paired phones and tablets are checked too, in case the host is no longer discoverable.
+            pairedQueued = true;
+            for (BluetoothDevice device : bluetoothAdapter.getBondedDevices()) {
+                if (RoomScanner.isPhoneOrTablet(device.getBluetoothClass()) && seenAddresses.add(device.getAddress())) {
+                    probeQueue.addLast(device);
+                }
+            }
+            if (!probeQueue.isEmpty()) {
+                probeNext();
+                return;
+            }
+        }
+        finishFindingRooms();
+    }
+
+    private void finishFindingRooms() {
+        stopFindingRooms();
+        setStatus(rooms.isEmpty()
+                ? "No rooms found. Ask the host to tap Create and allow their phone to be visible."
+                : "Found " + rooms.size() + (rooms.size() == 1 ? " room" : " rooms") + ". Tap one to ask to join.");
+    }
+
+    private void stopFindingRooms() {
+        findingRooms = false;
+        scanSession++;
+        probing = false;
+        pausedForProbe = false;
+        probeQueue.clear();
+        handler.removeCallbacks(findTimeout);
+        if (findButton != null) {
+            findButton.setText("Find rooms");
+        }
+        if (scanner != null) {
+            scanner.cancel();
+            scanner = null;
+        }
+        try {
+            if (bluetoothAdapter != null && bluetoothAdapter.isDiscovering()) {
+                bluetoothAdapter.cancelDiscovery();
+            }
+        } catch (Exception ignored) {
+        }
+    }
+
+    private void log(String line) {
+        scanLog.addLast(line);
+        while (scanLog.size() > MAX_SCAN_LOG_LINES) {
+            scanLog.removeFirst();
+        }
+        renderScanLog();
+    }
+
+    private void renderScanLog() {
+        if (scanLogText == null) {
+            return;
+        }
+        scanLogText.setVisibility(scanLog.isEmpty() ? View.GONE : View.VISIBLE);
+        scanLogText.setText(join(scanLog, "\n"));
+    }
+
+    private static String label(BluetoothDevice device) {
+        String name = device.getName();
+        return (name == null || name.trim().length() == 0 ? "Unknown device" : name)
+                + " (" + RoomProtocol.addressTail(device.getAddress()) + ")";
+    }
+
+    private void askToJoin(RoomScanner.FoundRoom room) {
+        if (!ensureBluetoothReady() || !ensureService()) {
+            return;
+        }
+        if (chatService.hasRoom()) {
+            setStatus("You are already in a room.");
+            return;
+        }
+        stopFindingRooms();
+        chatService.joinRoom(room.device, nickname());
+    }
+
+    private void cancelJoin() {
+        if (chatService != null && chatService.hasRoom()) {
+            closingByUser = true;
+            chatService.leaveRoom();
+        }
+    }
+
+    private void confirmLeave() {
+        if (chatService == null || !chatService.hasRoom()) {
+            return;
+        }
+        closeSidebar(true);
+        dismissDialog();
+        openDialog = new AlertDialog.Builder(this)
+                .setTitle("Leave the room?")
+                .setMessage("If you leave, the room is deleted for everyone in it.")
+                .setPositiveButton("Leave", new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface dialog, int which) {
+                        if (chatService != null && chatService.hasRoom()) {
+                            closingByUser = true;
+                            chatService.leaveRoom();
+                        }
+                    }
+                })
+                .setNegativeButton("Stay", null)
+                .show();
+    }
+
+    private void sendMessage() {
+        if (chatService == null) {
+            return;
+        }
+        String text = messageInput.getText().toString().trim();
+        if (text.length() == 0) {
+            return;
+        }
+        if (chatService.sendChat(text)) {
+            messageInput.setText("");
+        }
+    }
+
+    private void requestEnableBluetooth() {
+        if (bluetoothAdapter == null) {
+            setStatus("Bluetooth is not available on this device.");
+            return;
+        }
+        if (bluetoothAdapter.isEnabled()) {
+            setStatus("Bluetooth is already enabled.");
+            refreshLocalDeviceInfo();
+            return;
+        }
+        startActivityForResult(new Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE), REQUEST_ENABLE_BLUETOOTH);
+    }
+
+    // ---- Rendering ------------------------------------------------------------------------------
+
+    private void restoreFromService() {
+        setStatus(chatService.getLastStatus());
+        render(chatService.getRoomState(), true);
+        if (uiVisible) {
+            showUnseenClosedReason();
+        }
+    }
+
+    private void render(RoomState state, boolean forceRebuild) {
+        boolean wasInRoom = shownState.inRoom();
+        shownState = state;
+        if (state.inRoom()) {
+            if (!wasInRoom || forceRebuild || roomScreen.getVisibility() != View.VISIBLE) {
+                showScreen(roomScreen);
+                rebuildMessages();
+            }
+            roomTitleText.setText(state.title);
+            peopleButton.setText("People (" + state.members.size() + ")");
+            renderSidebar(state);
+            boolean canSend = state.phase == RoomState.Phase.ACTIVE;
+            sendButton.setEnabled(canSend);
+            messageInput.setEnabled(canSend);
+            updateTimeLeft();
+        } else if (state.joining()) {
+            closeSidebar(false);
+            showScreen(waitingScreen);
+            waitingTitleText.setText(state.title);
+            waitingStateText.setText(state.phase == RoomState.Phase.WAITING_APPROVAL
+                    ? "Waiting for the host to accept you (up to "
+                    + (RoomProtocol.APPROVAL_TIMEOUT_MS / 1000) + " seconds)..."
+                    : "Connecting to the host...");
+        } else {
+            closeSidebar(false);
+            if (wasInRoom || forceRebuild || lobbyScreen.getVisibility() != View.VISIBLE) {
+                showScreen(lobbyScreen);
+                messagesContainer.removeAllViews();
+                messageInput.setText("");
+                refreshLocalDeviceInfo();
+            }
+        }
+        renderJoinRequest(state.host ? state.pendingRequest : null);
+    }
+
+    private void showScreen(LinearLayout screen) {
+        lobbyScreen.setVisibility(screen == lobbyScreen ? View.VISIBLE : View.GONE);
+        waitingScreen.setVisibility(screen == waitingScreen ? View.VISIBLE : View.GONE);
+        roomScreen.setVisibility(screen == roomScreen ? View.VISIBLE : View.GONE);
+        handler.removeCallbacks(countdownTick);
+        if (screen == roomScreen) {
+            getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+            stopFindingRooms();
+            handler.post(countdownTick);
+        } else {
+            getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        }
+    }
+
+    /** Host only: shows the oldest pending join request as a dialog. */
+    private void renderJoinRequest(final RoomState.JoinRequest request) {
+        if (request == null || request.id.equals(answeredRequestId)) {
+            dismissRequestDialog();
+            return;
+        }
+        if (request.id.equals(shownRequestId) && requestDialog != null && requestDialog.isShowing()) {
+            return;
+        }
+        dismissRequestDialog();
+        shownRequestId = request.id;
+        String deviceName = request.deviceName == null ? "(name not known yet)" : request.deviceName;
+        requestDialog = new AlertDialog.Builder(this)
+                .setTitle("Join request")
+                .setMessage("Nickname: " + request.nick
+                        + "\nDevice name: " + deviceName
+                        + "\nAddress ends in: " + request.addressTail
+                        + "\nModel: " + request.model
+                        + "\n\nCheck that this matches the waiting screen of the person asking."
+                        + "\nNo answer within " + (RoomProtocol.APPROVAL_TIMEOUT_MS / 1000)
+                        + " seconds declines automatically.")
+                .setCancelable(false)
+                .setPositiveButton("Accept", new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface dialog, int which) {
+                        answer(request.id, true);
+                    }
+                })
+                .setNegativeButton("Decline", new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface dialog, int which) {
+                        answer(request.id, false);
+                    }
+                })
+                .show();
+    }
+
+    private void answer(String requestId, boolean accept) {
+        requestDialog = null;
+        shownRequestId = null;
+        answeredRequestId = requestId;
+        if (chatService != null) {
+            chatService.answerJoinRequest(requestId, accept);
+        }
+    }
+
+    private void rebuildMessages() {
+        messagesContainer.removeAllViews();
+        if (chatService != null) {
+            for (ChatService.ChatEntry entry : chatService.getHistory()) {
+                appendEntry(entry);
+            }
+        }
+    }
+
+    private void updateTimeLeft() {
+        RoomState state = shownState;
+        if (!state.inRoom()) {
+            return;
+        }
+        String left = "";
+        if (state.endsAtElapsed > 0) {
+            long seconds = Math.max(0L, (state.endsAtElapsed - SystemClock.elapsedRealtime()) / 1000L);
+            left = String.format(Locale.US, "%d:%02d left", seconds / 60, seconds % 60);
+        }
+        if (state.phase == RoomState.Phase.RECONNECTING) {
+            left = "Reconnecting...  " + left;
+        }
+        timeLeftText.setText(left);
+        sidebarTimeText.setText(left);
+    }
+
+    // ---- Side panel -----------------------------------------------------------------------------
+
+    private void openSidebar() {
+        if (sidebarOpen || !shownState.inRoom()) {
+            return;
+        }
+        sidebarOpen = true;
+        renderSidebar(shownState);
+        sidebarScrim.setVisibility(View.VISIBLE);
+        sidebar.setVisibility(View.VISIBLE);
+        sidebar.setTranslationX(sidebarWidth);
+        sidebar.animate().translationX(0f).setDuration(200L).start();
+    }
+
+    private void closeSidebar(boolean animate) {
+        if (!sidebarOpen) {
+            return;
+        }
+        sidebarOpen = false;
+        sidebarScrim.setVisibility(View.GONE);
+        sidebar.animate().cancel();
+        if (animate) {
+            sidebar.animate().translationX(sidebarWidth).setDuration(200L).withEndAction(new Runnable() {
+                @Override
+                public void run() {
+                    if (!sidebarOpen) {
+                        sidebar.setVisibility(View.GONE);
+                    }
+                }
+            }).start();
+        } else {
+            sidebar.setVisibility(View.GONE);
+        }
+    }
+
+    /** Fills the side panel: room title, time left and one row per member. */
+    private void renderSidebar(RoomState state) {
+        sidebarTitleText.setText(state.title);
+        sidebarCountText.setText("People (" + state.members.size() + "/" + (RoomProtocol.MAX_MEMBERS + 1) + ")");
+        sidebarMembers.removeAllViews();
+        for (String line : state.members) {
+            boolean host = line.endsWith(" (host)");
+            boolean reconnecting = line.endsWith(" (reconnecting)");
+            String name = host ? line.substring(0, line.length() - " (host)".length())
+                    : reconnecting ? line.substring(0, line.length() - " (reconnecting)".length())
+                    : line;
+            StringBuilder tags = new StringBuilder();
+            if (host) {
+                tags.append("host");
+            }
+            if (state.isMe(line)) {
+                tags.append(tags.length() > 0 ? ", " : "").append("you");
+            }
+            if (reconnecting) {
+                tags.append(tags.length() > 0 ? ", " : "").append("reconnecting...");
+            }
+
+            TextView row = new TextView(this);
+            row.setText((reconnecting ? "\u25CB  " : "\u25CF  ") + name
+                    + (tags.length() > 0 ? "\n     " + tags : ""));
+            row.setTextSize(15f);
+            row.setTextColor(reconnecting ? Color.rgb(140, 150, 148) : Color.rgb(24, 35, 34));
+            if (state.isMe(line)) {
+                row.setTypeface(Typeface.DEFAULT_BOLD);
+            }
+            row.setPadding(0, dp(8), 0, dp(8));
+            sidebarMembers.addView(row, matchWrap());
+        }
+    }
+
+    private void appendEntry(ChatService.ChatEntry entry) {
+        TextView row;
+        if (entry.notice) {
+            row = messageRow("- " + entry.text + " -", Gravity.CENTER_HORIZONTAL, Color.rgb(96, 108, 106));
+            row.setTextSize(13f);
+        } else {
+            String prefix = entry.mine ? "me" : entry.sender;
+            row = messageRow(prefix + ": " + entry.text,
+                    entry.mine ? Gravity.RIGHT : Gravity.LEFT,
+                    entry.mine ? Color.rgb(0, 105, 92) : Color.rgb(34, 46, 44));
+        }
+        messagesContainer.addView(row);
+        messagesScroll.post(new Runnable() {
+            @Override
+            public void run() {
+                messagesScroll.fullScroll(View.FOCUS_DOWN);
+            }
+        });
+    }
+
+    private void showUnseenClosedReason() {
+        if (chatService == null) {
+            return;
+        }
+        String reason = chatService.takeUnseenClosedReason();
+        if (reason != null) {
+            render(RoomState.IDLE, false);
+            if (closingByUser) {
+                closingByUser = false;
+                return;
+            }
+            showClosedDialog("little chatter", reason);
+        }
+    }
+
+    private void showClosedDialog(String title, String reason) {
+        dismissDialog();
+        openDialog = new AlertDialog.Builder(this)
+                .setTitle(title)
+                .setMessage(reason)
+                .setPositiveButton("OK", null)
+                .show();
+    }
+
+    private void dismissDialog() {
+        if (openDialog != null && openDialog.isShowing()) {
+            openDialog.dismiss();
+        }
+        openDialog = null;
+    }
+
+    private void dismissRequestDialog() {
+        if (requestDialog != null && requestDialog.isShowing()) {
+            requestDialog.dismiss();
+        }
+        requestDialog = null;
+        shownRequestId = null;
+    }
+
+    private void setStatus(String message) {
+        if (statusText != null) {
+            statusText.setText(message);
+        }
+    }
+
+    // ---- Layout -------------------------------------------------------------------------------
+
+    private View buildUnsupportedView() {
+        TextView message = new TextView(this);
+        message.setText("little chatter only runs on Android 4.4.x (KitKat).\n"
+                + "This device is running Android " + Build.VERSION.RELEASE
+                + " (API " + Build.VERSION.SDK_INT + ").\n\n"
+                + "little chatter는 Android 4.4.x(킷캣) 전용입니다.");
+        message.setTextSize(16f);
+        message.setTextColor(Color.rgb(24, 35, 34));
+        message.setGravity(Gravity.CENTER);
+        message.setPadding(dp(24), dp(24), dp(24), dp(24));
+        return message;
     }
 
     private View buildContentView() {
@@ -113,347 +859,343 @@ public final class MainActivity extends Activity implements BluetoothClassicMesh
         root.addView(title);
 
         statusText = new TextView(this);
-        statusText.setText("Bluetooth Classic transport for Android 4.4/API 19.");
         statusText.setTextSize(13f);
         statusText.setTextColor(Color.rgb(64, 78, 76));
         statusText.setPadding(0, dp(6), 0, dp(4));
         root.addView(statusText);
 
-        peerText = new TextView(this);
-        peerText.setText("Peers: 0");
-        peerText.setTextSize(13f);
-        peerText.setTextColor(Color.rgb(64, 78, 76));
-        root.addView(peerText);
+        lobbyScreen = buildLobbyScreen();
+        waitingScreen = buildWaitingScreen();
+        roomScreen = buildRoomScreen();
+        root.addView(lobbyScreen, weighted());
+        root.addView(waitingScreen, weighted());
+        root.addView(roomScreen, weighted());
+        waitingScreen.setVisibility(View.GONE);
+        roomScreen.setVisibility(View.GONE);
 
-        scanScreen = buildScanScreen();
-        chatScreen = buildChatScreen();
+        contentFrame = new FrameLayout(this);
+        contentFrame.addView(root, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
 
-        root.addView(scanScreen, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                0,
-                1f
-        ));
-        root.addView(chatScreen, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                0,
-                1f
-        ));
+        sidebarScrim = new View(this);
+        sidebarScrim.setBackgroundColor(Color.argb(110, 0, 0, 0));
+        sidebarScrim.setVisibility(View.GONE);
+        sidebarScrim.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                closeSidebar(true);
+            }
+        });
+        contentFrame.addView(sidebarScrim, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
 
-        resetChatWindow();
-        showScanScreen();
-        return root;
+        int screenWidth = getResources().getDisplayMetrics().widthPixels;
+        sidebarWidth = Math.min(Math.round(screenWidth * 0.8f), dp(300));
+        sidebar = buildSidebar();
+        sidebar.setVisibility(View.GONE);
+        contentFrame.addView(sidebar, new FrameLayout.LayoutParams(
+                sidebarWidth, FrameLayout.LayoutParams.MATCH_PARENT, Gravity.RIGHT));
+        return contentFrame;
     }
 
-    private LinearLayout buildScanScreen() {
+    private LinearLayout buildSidebar() {
+        LinearLayout panel = new LinearLayout(this);
+        panel.setOrientation(LinearLayout.VERTICAL);
+        panel.setBackgroundColor(Color.WHITE);
+        panel.setPadding(dp(16), dp(18), dp(16), dp(12));
+        // Swallow taps so they do not fall through to the scrim or the chat.
+        panel.setClickable(true);
+
+        sidebarTitleText = new TextView(this);
+        sidebarTitleText.setTextSize(18f);
+        sidebarTitleText.setTypeface(Typeface.DEFAULT_BOLD);
+        sidebarTitleText.setTextColor(Color.rgb(24, 35, 34));
+        panel.addView(sidebarTitleText, matchWrap());
+
+        sidebarTimeText = new TextView(this);
+        sidebarTimeText.setTextSize(14f);
+        sidebarTimeText.setTextColor(Color.rgb(0, 105, 92));
+        sidebarTimeText.setPadding(0, dp(2), 0, dp(12));
+        panel.addView(sidebarTimeText, matchWrap());
+
+        sidebarCountText = new TextView(this);
+        sidebarCountText.setTextSize(13f);
+        sidebarCountText.setTypeface(Typeface.DEFAULT_BOLD);
+        sidebarCountText.setTextColor(Color.rgb(64, 78, 76));
+        panel.addView(sidebarCountText, matchWrap());
+
+        sidebarMembers = new LinearLayout(this);
+        sidebarMembers.setOrientation(LinearLayout.VERTICAL);
+        ScrollView membersScroll = new ScrollView(this);
+        membersScroll.addView(sidebarMembers);
+        panel.addView(membersScroll, weighted());
+
+        TextView leaveNote = new TextView(this);
+        leaveNote.setText("Leaving deletes the room for everyone.");
+        leaveNote.setTextSize(12f);
+        leaveNote.setTextColor(Color.rgb(120, 60, 60));
+        leaveNote.setPadding(0, dp(8), 0, dp(4));
+        panel.addView(leaveNote, matchWrap());
+
+        Button leave = button("Leave room", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                confirmLeave();
+            }
+        });
+        leave.setTextColor(Color.rgb(176, 32, 32));
+        panel.addView(leave, matchWrap());
+        return panel;
+    }
+
+    private LinearLayout buildLobbyScreen() {
         LinearLayout screen = new LinearLayout(this);
         screen.setOrientation(LinearLayout.VERTICAL);
-        screen.setPadding(0, dp(10), 0, 0);
-
-        TextView screenTitle = screenTitle("Bluetooth Scan");
-        screen.addView(screenTitle);
 
         nicknameInput = new EditText(this);
         nicknameInput.setHint("Nickname");
         nicknameInput.setSingleLine(true);
-        nicknameInput.setText(defaultNickname());
+        nicknameInput.setText("little-" + Build.MODEL);
+        nicknameInput.setFilters(new InputFilter[]{new InputFilter.LengthFilter(RoomProtocol.MAX_NICKNAME_CHARS)});
         screen.addView(nicknameInput, matchWrap());
 
         localDeviceText = new TextView(this);
-        localDeviceText.setTextSize(13f);
+        localDeviceText.setTextSize(12f);
         localDeviceText.setTextColor(Color.rgb(64, 78, 76));
-        localDeviceText.setPadding(0, dp(4), 0, dp(4));
         screen.addView(localDeviceText);
 
+        // Create a room.
+        screen.addView(sectionTitle("Create a room"));
+        LinearLayout createRow = new LinearLayout(this);
+        createRow.setOrientation(LinearLayout.HORIZONTAL);
+        createRow.setGravity(Gravity.CENTER_VERTICAL);
+        durationGroup = new RadioGroup(this);
+        durationGroup.setOrientation(RadioGroup.HORIZONTAL);
+        for (int i = 0; i < ROOM_MINUTES.length; i++) {
+            RadioButton option = new RadioButton(this);
+            option.setId(1000 + i);
+            option.setText(ROOM_MINUTES[i] + " min");
+            option.setTextSize(13f);
+            durationGroup.addView(option);
+        }
+        durationGroup.check(1000 + DEFAULT_ROOM_MINUTES_INDEX);
+        createRow.addView(durationGroup, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        createRow.addView(button("Create", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                createRoom();
+            }
+        }));
+        screen.addView(createRow, matchWrap());
+
+        // Join a room.
+        screen.addView(sectionTitle("Rooms nearby"));
+        findButton = button("Find rooms", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                toggleFindRooms();
+            }
+        });
         screen.addView(buttonRow(
-                button("Enable", new View.OnClickListener() {
+                button("Enable BT", new View.OnClickListener() {
                     @Override
                     public void onClick(View v) {
                         requestEnableBluetooth();
                     }
                 }),
-                button("Listen", new View.OnClickListener() {
-                    @Override
-                    public void onClick(View v) {
-                        startListening();
-                    }
-                }),
-                button("Discoverable", new View.OnClickListener() {
-                    @Override
-                    public void onClick(View v) {
-                        requestDiscoverable();
-                    }
-                })
+                findButton
         ));
 
-        screen.addView(buttonRow(
-                button("Scan Classic", new View.OnClickListener() {
-                    @Override
-                    public void onClick(View v) {
-                        startClassicDiscovery();
-                    }
-                }),
-                button("BLE Scan", new View.OnClickListener() {
-                    @Override
-                    public void onClick(View v) {
-                        toggleBleScan();
-                    }
-                }),
-                button("Connect", new View.OnClickListener() {
-                    @Override
-                    public void onClick(View v) {
-                        connectSelectedDevice();
-                    }
-                }),
-                button("Stop", new View.OnClickListener() {
-                    @Override
-                    public void onClick(View v) {
-                        stopEverything();
-                    }
-                })
-        ));
-
-        deviceAdapter = new ArrayAdapter<DeviceRow>(this, android.R.layout.simple_list_item_activated_1, devices);
-        ListView deviceList = new ListView(this);
-        deviceList.setChoiceMode(ListView.CHOICE_MODE_SINGLE);
-        deviceList.setAdapter(deviceAdapter);
-        deviceList.setOnItemClickListener(new AdapterView.OnItemClickListener() {
+        roomAdapter = new ArrayAdapter<RoomScanner.FoundRoom>(this, android.R.layout.simple_list_item_1, rooms);
+        ListView roomList = new ListView(this);
+        roomList.setAdapter(roomAdapter);
+        roomList.setOnItemClickListener(new AdapterView.OnItemClickListener() {
             @Override
             public void onItemClick(AdapterView<?> parent, View view, int position, long id) {
-                selectedDevice = devices.get(position);
-                setStatus("Selected " + selectedDevice);
+                askToJoin(rooms.get(position));
             }
         });
-        screen.addView(deviceList, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                0,
-                1f
-        ));
+        screen.addView(roomList, weighted());
+
+        scanLogText = new TextView(this);
+        scanLogText.setTextSize(11f);
+        scanLogText.setTypeface(Typeface.MONOSPACE);
+        scanLogText.setTextColor(Color.rgb(80, 91, 89));
+        scanLogText.setBackgroundColor(Color.WHITE);
+        scanLogText.setPadding(dp(6), dp(4), dp(6), dp(4));
+        scanLogText.setVisibility(View.GONE);
+        screen.addView(scanLogText, matchWrap());
 
         TextView hint = new TextView(this);
-        hint.setText("Select a device, then Connect. BLE Scan only helps discover BLE advertisers; chat uses Classic.");
+        hint.setText("Host: pick a time and tap Create. Others: tap Find rooms, then tap a room to ask "
+                + "to join. The host accepts each person. Up to " + (RoomProtocol.MAX_MEMBERS + 1) + " people.");
         hint.setTextSize(12f);
         hint.setTextColor(Color.rgb(80, 91, 89));
         hint.setPadding(0, dp(6), 0, 0);
         screen.addView(hint);
-
         return screen;
     }
 
-    private LinearLayout buildChatScreen() {
+    private LinearLayout buildWaitingScreen() {
         LinearLayout screen = new LinearLayout(this);
         screen.setOrientation(LinearLayout.VERTICAL);
-        screen.setPadding(0, dp(10), 0, 0);
+        screen.setGravity(Gravity.CENTER_HORIZONTAL);
+        screen.setPadding(0, dp(24), 0, 0);
+
+        waitingTitleText = new TextView(this);
+        waitingTitleText.setTextSize(18f);
+        waitingTitleText.setTypeface(Typeface.DEFAULT_BOLD);
+        waitingTitleText.setTextColor(Color.rgb(24, 35, 34));
+        waitingTitleText.setGravity(Gravity.CENTER);
+        screen.addView(waitingTitleText, matchWrap());
+
+        waitingStateText = new TextView(this);
+        waitingStateText.setTextSize(14f);
+        waitingStateText.setTextColor(Color.rgb(64, 78, 76));
+        waitingStateText.setGravity(Gravity.CENTER);
+        waitingStateText.setPadding(0, dp(8), 0, dp(20));
+        screen.addView(waitingStateText, matchWrap());
+
+        TextView showHost = new TextView(this);
+        showHost.setText("Show this screen to the host so they can check it's you:");
+        showHost.setTextSize(13f);
+        showHost.setTextColor(Color.rgb(64, 78, 76));
+        showHost.setGravity(Gravity.CENTER);
+        screen.addView(showHost, matchWrap());
+
+        waitingDeviceText = new TextView(this);
+        waitingDeviceText.setTextSize(22f);
+        waitingDeviceText.setTypeface(Typeface.DEFAULT_BOLD);
+        waitingDeviceText.setTextColor(Color.rgb(0, 105, 92));
+        waitingDeviceText.setGravity(Gravity.CENTER);
+        waitingDeviceText.setBackgroundColor(Color.WHITE);
+        waitingDeviceText.setPadding(dp(12), dp(16), dp(12), dp(16));
+        LinearLayout.LayoutParams deviceParams = matchWrap();
+        deviceParams.setMargins(0, dp(8), 0, dp(20));
+        screen.addView(waitingDeviceText, deviceParams);
+
+        screen.addView(button("Cancel request", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                cancelJoin();
+            }
+        }));
+        return screen;
+    }
+
+    private LinearLayout buildRoomScreen() {
+        LinearLayout screen = new LinearLayout(this);
+        screen.setOrientation(LinearLayout.VERTICAL);
+        screen.setPadding(0, dp(6), 0, 0);
 
         LinearLayout header = new LinearLayout(this);
         header.setOrientation(LinearLayout.HORIZONTAL);
         header.setGravity(Gravity.CENTER_VERTICAL);
-
-        TextView screenTitle = screenTitle("Chat");
-        header.addView(screenTitle, new LinearLayout.LayoutParams(
-                0,
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                1f
-        ));
-        header.addView(button("Disconnect", new View.OnClickListener() {
+        roomTitleText = new TextView(this);
+        roomTitleText.setTextSize(18f);
+        roomTitleText.setTypeface(Typeface.DEFAULT_BOLD);
+        roomTitleText.setTextColor(Color.rgb(24, 35, 34));
+        header.addView(roomTitleText, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        peopleButton = button("People", new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                stopEverything();
+                openSidebar();
             }
-        }));
-        screen.addView(header);
+        });
+        header.addView(peopleButton);
+        screen.addView(header, matchWrap());
+
+        timeLeftText = new TextView(this);
+        timeLeftText.setTextSize(14f);
+        timeLeftText.setTypeface(Typeface.DEFAULT_BOLD);
+        timeLeftText.setTextColor(Color.rgb(0, 105, 92));
+        screen.addView(timeLeftText);
 
         messagesContainer = new LinearLayout(this);
         messagesContainer.setOrientation(LinearLayout.VERTICAL);
-
         messagesScroll = new ScrollView(this);
         messagesScroll.setBackgroundColor(Color.WHITE);
         messagesScroll.addView(messagesContainer);
-        LinearLayout.LayoutParams messagesParams = new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                0,
-                1f
-        );
+        LinearLayout.LayoutParams messagesParams = weighted();
         messagesParams.setMargins(0, dp(8), 0, dp(8));
         screen.addView(messagesScroll, messagesParams);
 
         LinearLayout composer = new LinearLayout(this);
         composer.setOrientation(LinearLayout.HORIZONTAL);
         composer.setGravity(Gravity.CENTER_VERTICAL);
-
         messageInput = new EditText(this);
         messageInput.setHint("Message");
         messageInput.setMinLines(1);
         messageInput.setMaxLines(3);
-        composer.addView(messageInput, new LinearLayout.LayoutParams(
-                0,
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                1f
-        ));
-        composer.addView(button("Send", new View.OnClickListener() {
+        messageInput.setFilters(new InputFilter[]{new InputFilter.LengthFilter(RoomProtocol.MAX_TEXT_CHARS)});
+        composer.addView(messageInput, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        sendButton = button("Send", new View.OnClickListener() {
             @Override
             public void onClick(View v) {
                 sendMessage();
             }
-        }));
-        screen.addView(composer);
-
+        });
+        composer.addView(sendButton);
+        screen.addView(composer, matchWrap());
         return screen;
     }
 
-    private void registerClassicDiscoveryReceiver() {
-        IntentFilter filter = new IntentFilter();
-        filter.addAction(BluetoothAdapter.ACTION_DISCOVERY_STARTED);
-        filter.addAction(BluetoothAdapter.ACTION_DISCOVERY_FINISHED);
-        filter.addAction(BluetoothDevice.ACTION_FOUND);
-        registerReceiver(classicDiscoveryReceiver, filter);
+    private TextView sectionTitle(String text) {
+        TextView title = new TextView(this);
+        title.setText(text);
+        title.setTextSize(15f);
+        title.setTypeface(Typeface.DEFAULT_BOLD);
+        title.setTextColor(Color.rgb(24, 35, 34));
+        title.setPadding(0, dp(10), 0, 0);
+        return title;
     }
 
-    private void requestEnableBluetooth() {
-        if (bluetoothAdapter == null) {
-            setStatus("Bluetooth is not available on this device.");
-            return;
-        }
-        if (bluetoothAdapter.isEnabled()) {
-            setStatus("Bluetooth is already enabled.");
-            refreshLocalDeviceInfo();
-            refreshPairedDevices();
-            return;
-        }
-        startActivityForResult(new Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE), REQUEST_ENABLE_BLUETOOTH);
+    private TextView messageRow(String text, int gravity, int color) {
+        TextView row = new TextView(this);
+        row.setText(text);
+        row.setTextSize(15f);
+        row.setTextColor(color);
+        row.setGravity(gravity);
+        row.setPadding(dp(10), dp(6), dp(10), dp(6));
+        return row;
     }
 
-    private void startListening() {
-        if (!ensureBluetoothReady() || !ensureRuntimePermissions()) {
-            return;
-        }
-        meshService.startListening();
-        refreshPairedDevices();
+    private Button button(String text, View.OnClickListener listener) {
+        Button button = new Button(this);
+        button.setText(text);
+        button.setTextSize(12f);
+        button.setOnClickListener(listener);
+        return button;
     }
 
-    private void requestDiscoverable() {
-        if (!ensureBluetoothReady() || !ensureRuntimePermissions()) {
-            return;
+    private LinearLayout buttonRow(Button... buttons) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setPadding(0, dp(6), 0, 0);
+        for (Button button : buttons) {
+            LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+            params.setMargins(dp(2), 0, dp(2), 0);
+            row.addView(button, params);
         }
-        Intent intent = new Intent(BluetoothAdapter.ACTION_REQUEST_DISCOVERABLE);
-        intent.putExtra(BluetoothAdapter.EXTRA_DISCOVERABLE_DURATION, DISCOVERABLE_SECONDS);
-        startActivity(intent);
+        return row;
     }
 
-    private void startClassicDiscovery() {
-        if (!ensureBluetoothReady() || !ensureRuntimePermissions()) {
-            return;
-        }
-        refreshPairedDevices();
-        try {
-            if (bluetoothAdapter.isDiscovering()) {
-                bluetoothAdapter.cancelDiscovery();
-            }
-            boolean started = bluetoothAdapter.startDiscovery();
-            setStatus(started ? "Starting Classic discovery..." : "Classic discovery could not start.");
-        } catch (SecurityException error) {
-            setStatus("Bluetooth permission denied: " + error.getMessage());
-        }
+    private LinearLayout.LayoutParams matchWrap() {
+        return new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
     }
 
-    private void toggleBleScan() {
-        if (bleScanning) {
-            stopBleScan();
-        } else {
-            startBleScan();
-        }
+    private LinearLayout.LayoutParams weighted() {
+        return new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f);
     }
 
-    @SuppressWarnings("deprecation")
-    private void startBleScan() {
-        if (!ensureBluetoothReady() || !ensureRuntimePermissions()) {
-            return;
-        }
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.JELLY_BEAN_MR2) {
-            setStatus("BLE scan requires Android 4.3/API 18 or newer.");
-            return;
-        }
+    // ---- Helpers ------------------------------------------------------------------------------
 
-        try {
-            bleScanning = bluetoothAdapter.startLeScan(leScanCallback);
-            setStatus(bleScanning ? "BLE scan started for 10 seconds." : "BLE scan could not start.");
-            if (bleScanning) {
-                handler.postDelayed(new Runnable() {
-                    @Override
-                    public void run() {
-                        stopBleScan();
-                    }
-                }, BLE_SCAN_MILLIS);
-            }
-        } catch (SecurityException error) {
-            setStatus("BLE scan permission denied: " + error.getMessage());
+    private boolean ensureService() {
+        if (chatService == null) {
+            setStatus("Starting up. Please try again in a moment.");
+            return false;
         }
-    }
-
-    @SuppressWarnings("deprecation")
-    private void stopBleScan() {
-        stopBleScanInternal(true);
-    }
-
-    @SuppressWarnings("deprecation")
-    private void stopBleScanSilently() {
-        stopBleScanInternal(false);
-    }
-
-    @SuppressWarnings("deprecation")
-    private void stopBleScanInternal(boolean announce) {
-        if (!bleScanning || bluetoothAdapter == null) {
-            return;
-        }
-        try {
-            bluetoothAdapter.stopLeScan(leScanCallback);
-        } catch (Exception ignored) {
-        }
-        bleScanning = false;
-        if (announce) {
-            setStatus("BLE scan stopped.");
-        }
-    }
-
-    private void connectSelectedDevice() {
-        if (!ensureBluetoothReady() || !ensureRuntimePermissions()) {
-            return;
-        }
-        if (connectedPeerCount > 0) {
-            setStatus("Already connected. Disconnect before connecting to another device.");
-            showChatScreen();
-            return;
-        }
-        if (selectedDevice == null) {
-            setStatus("Select a paired or discovered device first.");
-            return;
-        }
-        meshService.connect(selectedDevice.device);
-    }
-
-    private void stopEverything() {
-        stopBleScan();
-        try {
-            if (bluetoothAdapter != null && bluetoothAdapter.isDiscovering()) {
-                bluetoothAdapter.cancelDiscovery();
-            }
-        } catch (Exception ignored) {
-        }
-        meshService.stopAll();
-    }
-
-    private void sendMessage() {
-        String text = messageInput.getText().toString().trim();
-        if (text.length() == 0) {
-            setStatus("Type a message first.");
-            return;
-        }
-
-        String nickname = nicknameInput.getText().toString().trim();
-        if (nickname.length() == 0) {
-            nickname = defaultNickname();
-        }
-        meshService.sendLocalMessage(nickname, text);
-        messageInput.setText("");
+        return true;
     }
 
     private boolean ensureBluetoothReady() {
@@ -468,307 +1210,46 @@ public final class MainActivity extends Activity implements BluetoothClassicMesh
         return true;
     }
 
-    private boolean ensureRuntimePermissions() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
-            return true;
+    private int selectedRoomMinutes() {
+        int index = durationGroup.getCheckedRadioButtonId() - 1000;
+        if (index < 0 || index >= ROOM_MINUTES.length) {
+            index = DEFAULT_ROOM_MINUTES_INDEX;
         }
-
-        List<String> missing = new ArrayList<String>();
-        if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
-            missing.add(Manifest.permission.ACCESS_FINE_LOCATION);
-        }
-        if (Build.VERSION.SDK_INT >= 31) {
-            if (checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN) != PackageManager.PERMISSION_GRANTED) {
-                missing.add(Manifest.permission.BLUETOOTH_SCAN);
-            }
-            if (checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
-                missing.add(Manifest.permission.BLUETOOTH_CONNECT);
-            }
-        }
-
-        if (missing.isEmpty()) {
-            return true;
-        }
-
-        requestPermissions(missing.toArray(new String[missing.size()]), REQUEST_RUNTIME_PERMISSIONS);
-        return false;
+        return ROOM_MINUTES[index];
     }
 
+    private String nickname() {
+        String value = nicknameInput.getText().toString().trim();
+        return value.length() == 0 ? "little-" + Build.MODEL : value;
+    }
+
+    /** This phone's Bluetooth name, address tail and model, as the host will see them. */
     private void refreshLocalDeviceInfo() {
+        String identity;
         if (bluetoothAdapter == null) {
-            localDeviceText.setText("Local: no Bluetooth adapter");
-            return;
-        }
-        try {
+            identity = "no Bluetooth adapter";
+        } else {
             String name = bluetoothAdapter.getName();
-            String address = bluetoothAdapter.getAddress();
-            localDeviceText.setText("Local: " + safeLabel(name, "This device") + " / " + address);
-        } catch (SecurityException error) {
-            localDeviceText.setText("Local: Bluetooth permission required");
+            identity = (name == null || name.trim().length() == 0 ? "unnamed" : name)
+                    + "  (" + RoomProtocol.addressTail(bluetoothAdapter.getAddress()) + ")  "
+                    + RoomProtocol.cleanModel(Build.MODEL);
         }
-    }
-
-    private void refreshPairedDevices() {
-        if (bluetoothAdapter == null || !bluetoothAdapter.isEnabled()) {
-            return;
-        }
-        try {
-            for (BluetoothDevice device : bluetoothAdapter.getBondedDevices()) {
-                addDevice(device, "paired", Short.MIN_VALUE);
-            }
-        } catch (SecurityException error) {
-            setStatus("Cannot read paired devices: " + error.getMessage());
-        }
-    }
-
-    private void addDevice(BluetoothDevice device, String source, int rssi) {
-        if (device == null) {
-            return;
-        }
-
-        String key = device.getAddress() + ":" + source;
-        DeviceRow old = devicesByKey.get(key);
-        if (old != null) {
-            old.rssi = rssi;
-            deviceAdapter.notifyDataSetChanged();
-            return;
-        }
-
-        DeviceRow row = new DeviceRow(device, source, rssi);
-        devicesByKey.put(key, row);
-        devices.add(row);
-        if (deviceAdapter != null) {
-            deviceAdapter.notifyDataSetChanged();
-        }
-    }
-
-    @Override
-    public void onStatus(final String message) {
-        runOnUiThread(new Runnable() {
-            @Override
-            public void run() {
-                setStatus(message);
-            }
-        });
-    }
-
-    @Override
-    public void onPeerCountChanged(final int peerCount) {
-        runOnUiThread(new Runnable() {
-            @Override
-            public void run() {
-                connectedPeerCount = peerCount;
-                peerText.setText("Peers: " + peerCount);
-                if (peerCount > 0) {
-                    showChatScreen();
-                } else {
-                    showScanScreen();
-                }
-            }
-        });
-    }
-
-    @Override
-    public void onMessage(final String sender, final String text, final boolean mine, final int hops) {
-        runOnUiThread(new Runnable() {
-            @Override
-            public void run() {
-                appendChatMessage(sender, text, mine, hops);
-            }
-        });
-    }
-
-    private void setStatus(String message) {
-        statusText.setText(message);
-    }
-
-    private void appendSystemMessage(String message) {
-        TextView row = messageRow("[system] " + message, Gravity.CENTER_HORIZONTAL, Color.rgb(80, 91, 89));
-        messagesContainer.addView(row);
-    }
-
-    private void appendChatMessage(String sender, String message, boolean mine, int hops) {
-        String prefix = mine ? "me" : sender;
-        String suffix = hops > 0 ? "  hops=" + hops : "";
-        int gravity = mine ? Gravity.RIGHT : Gravity.LEFT;
-        int color = mine ? Color.rgb(0, 105, 92) : Color.rgb(34, 46, 44);
-        TextView row = messageRow(prefix + ": " + message + suffix, gravity, color);
-        messagesContainer.addView(row);
-        messagesScroll.post(new Runnable() {
-            @Override
-            public void run() {
-                messagesScroll.fullScroll(View.FOCUS_DOWN);
-            }
-        });
-    }
-
-    private void showScanScreen() {
-        if (scanScreen == null || chatScreen == null) {
-            return;
-        }
-        scanScreen.setVisibility(View.VISIBLE);
-        chatScreen.setVisibility(View.GONE);
-        getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-        resetChatWindow();
-        refreshLocalDeviceInfo();
-        refreshPairedDevices();
-    }
-
-    private void showChatScreen() {
-        if (scanScreen == null || chatScreen == null) {
-            return;
-        }
-        scanScreen.setVisibility(View.GONE);
-        chatScreen.setVisibility(View.VISIBLE);
-        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-        stopBleScanSilently();
-        try {
-            if (bluetoothAdapter != null && bluetoothAdapter.isDiscovering()) {
-                bluetoothAdapter.cancelDiscovery();
-            }
-        } catch (Exception ignored) {
-        }
-    }
-
-    private void resetChatWindow() {
-        if (messagesContainer != null) {
-            messagesContainer.removeAllViews();
-            appendSystemMessage("Connected. Messages in this chat session will appear here.");
-        }
-        if (messageInput != null) {
-            messageInput.setText("");
-        }
-    }
-
-    private TextView messageRow(String text, int gravity, int color) {
-        TextView row = new TextView(this);
-        row.setText(text);
-        row.setTextSize(15f);
-        row.setTextColor(color);
-        row.setGravity(gravity);
-        row.setPadding(dp(10), dp(6), dp(10), dp(6));
-        return row;
-    }
-
-    private TextView screenTitle(String text) {
-        TextView title = new TextView(this);
-        title.setText(text);
-        title.setTextSize(18f);
-        title.setTypeface(Typeface.DEFAULT_BOLD);
-        title.setTextColor(Color.rgb(24, 35, 34));
-        title.setPadding(0, 0, 0, dp(6));
-        return title;
-    }
-
-    private Button button(String text, View.OnClickListener listener) {
-        Button button = new Button(this);
-        button.setText(text);
-        button.setTextSize(12f);
-        button.setOnClickListener(listener);
-        return button;
-    }
-
-    private LinearLayout buttonRow(Button... buttons) {
-        LinearLayout row = new LinearLayout(this);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        row.setGravity(Gravity.CENTER_VERTICAL);
-        row.setPadding(0, dp(6), 0, 0);
-
-        for (Button button : buttons) {
-            LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
-                    0,
-                    LinearLayout.LayoutParams.WRAP_CONTENT,
-                    1f
-            );
-            params.setMargins(dp(2), 0, dp(2), 0);
-            row.addView(button, params);
-        }
-        return row;
-    }
-
-    private LinearLayout.LayoutParams matchWrap() {
-        return new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-        );
-    }
-
-    private String defaultNickname() {
-        return "little-" + Build.MODEL;
+        localDeviceText.setText("This device: " + identity);
+        waitingDeviceText.setText(identity.replace("  (", "\n(").replace(")  ", ")\n"));
     }
 
     private int dp(int value) {
         return Math.round(value * getResources().getDisplayMetrics().density);
     }
 
-    private static String safeLabel(String value, String fallback) {
-        return value == null || value.trim().length() == 0 ? fallback : value;
-    }
-
-    @Override
-    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
-        super.onActivityResult(requestCode, resultCode, data);
-        if (requestCode == REQUEST_ENABLE_BLUETOOTH) {
-            refreshLocalDeviceInfo();
-            refreshPairedDevices();
-            setStatus(resultCode == RESULT_OK ? "Bluetooth enabled." : "Bluetooth was not enabled.");
-        }
-    }
-
-    @Override
-    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
-        if (requestCode != REQUEST_RUNTIME_PERMISSIONS) {
-            return;
-        }
-
-        boolean allGranted = true;
-        for (int result : grantResults) {
-            if (result != PackageManager.PERMISSION_GRANTED) {
-                allGranted = false;
-                break;
+    private static String join(List<String> values, String separator) {
+        StringBuilder builder = new StringBuilder();
+        for (String value : values) {
+            if (builder.length() > 0) {
+                builder.append(separator);
             }
+            builder.append(value);
         }
-        setStatus(allGranted ? "Permissions granted." : "Bluetooth/location permissions are required.");
-        if (allGranted) {
-            refreshLocalDeviceInfo();
-            refreshPairedDevices();
-        }
-    }
-
-    @Override
-    protected void onDestroy() {
-        stopEverything();
-        try {
-            unregisterReceiver(classicDiscoveryReceiver);
-        } catch (Exception ignored) {
-        }
-        getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-        super.onDestroy();
-    }
-
-    private static final class DeviceRow {
-        final BluetoothDevice device;
-        final String source;
-        int rssi;
-
-        DeviceRow(BluetoothDevice device, String source, int rssi) {
-            this.device = device;
-            this.source = source;
-            this.rssi = rssi;
-        }
-
-        @Override
-        public String toString() {
-            String name;
-            try {
-                name = device.getName();
-            } catch (SecurityException ignored) {
-                name = null;
-            }
-            String label = safeLabel(name, "Unknown device");
-            String signal = rssi == Short.MIN_VALUE ? "" : "  RSSI " + rssi;
-            return label + "\n" + device.getAddress() + "  [" + source + "]" + signal;
-        }
+        return builder.toString();
     }
 }

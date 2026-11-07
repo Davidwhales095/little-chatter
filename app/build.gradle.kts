@@ -8,8 +8,10 @@ android {
 
     defaultConfig {
         applicationId = "com.messenger.little"
+        // Android 4.4.x (KitKat, API 19) only.
         minSdk = 19
-        targetSdk = 23
+        targetSdk = 19
+        maxSdk = 19
         versionCode = 1
         versionName = "0.1.0"
     }
