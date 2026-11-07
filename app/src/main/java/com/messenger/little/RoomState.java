@@ -39,7 +39,7 @@ final class RoomState {
         }
     }
 
-    static final RoomState IDLE = new RoomState(Phase.IDLE, false, "", 0L, new ArrayList<String>(), null);
+    static final RoomState IDLE = new RoomState(Phase.IDLE, false, "", 0L, new ArrayList<String>(), null, "");
 
     final Phase phase;
     final boolean host;
@@ -51,15 +51,26 @@ final class RoomState {
     final List<String> members;
     /** Host only: the join request to show now, or null. */
     final JoinRequest pendingRequest;
+    /** This device's nickname in the room. */
+    final String me;
 
     RoomState(Phase phase, boolean host, String title, long endsAtElapsed, List<String> members,
-              JoinRequest pendingRequest) {
+              JoinRequest pendingRequest, String me) {
         this.phase = phase;
         this.host = host;
         this.title = title;
         this.endsAtElapsed = endsAtElapsed;
         this.members = Collections.unmodifiableList(new ArrayList<String>(members));
         this.pendingRequest = pendingRequest;
+        this.me = me;
+    }
+
+    /** True if a member line ("Bob", "Bob (host)", "Bob (reconnecting)") is this device. */
+    boolean isMe(String memberLine) {
+        // Exact suffixes only, so "Bob (2)" is not mistaken for "Bob".
+        return me.length() > 0 && (memberLine.equals(me)
+                || memberLine.equals(me + " (host)")
+                || memberLine.equals(me + " (reconnecting)"));
     }
 
     boolean inRoom() {

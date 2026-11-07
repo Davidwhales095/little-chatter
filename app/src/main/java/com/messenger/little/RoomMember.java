@@ -71,7 +71,7 @@ final class RoomMember implements RoomSession, BluetoothLink.Callback {
         this.nick = requestedNick;
         String hostName = hostDevice.getName();
         this.title = "Room on " + (hostName == null ? hostDevice.getAddress() : hostName);
-        this.state = new RoomState(RoomState.Phase.CONNECTING, false, title, 0L, members, null);
+        this.state = new RoomState(RoomState.Phase.CONNECTING, false, title, 0L, members, null, nick);
         loop.setExecuteExistingDelayedTasksAfterShutdownPolicy(false);
         loop.setContinueExistingPeriodicTasksAfterShutdownPolicy(false);
     }
@@ -384,7 +384,7 @@ final class RoomMember implements RoomSession, BluetoothLink.Callback {
     }
 
     private void publishState() {
-        state = new RoomState(phase, false, title, endsAtElapsed, members, null);
+        state = new RoomState(phase, false, title, endsAtElapsed, members, null, nick);
         listener.onStateChanged(state);
     }
 

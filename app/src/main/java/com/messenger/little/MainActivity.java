@@ -27,6 +27,7 @@ import android.widget.AdapterView;
 import android.widget.ArrayAdapter;
 import android.widget.Button;
 import android.widget.EditText;
+import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.ListView;
 import android.widget.RadioButton;
@@ -98,7 +99,17 @@ public final class MainActivity extends Activity implements ChatService.UiListen
     private TextView waitingDeviceText;
     private TextView roomTitleText;
     private TextView timeLeftText;
-    private TextView membersText;
+    private Button peopleButton;
+    // Side panel with the room's members and the Leave button.
+    private FrameLayout contentFrame;
+    private View sidebarScrim;
+    private LinearLayout sidebar;
+    private int sidebarWidth;
+    private boolean sidebarOpen = false;
+    private TextView sidebarTitleText;
+    private TextView sidebarTimeText;
+    private TextView sidebarCountText;
+    private LinearLayout sidebarMembers;
     private LinearLayout messagesContainer;
     private ScrollView messagesScroll;
     private EditText messageInput;
@@ -204,6 +215,10 @@ public final class MainActivity extends Activity implements ChatService.UiListen
 
     @Override
     public void onBackPressed() {
+        if (sidebarOpen) {
+            closeSidebar(true);
+            return;
+        }
         // While in (or joining) a room, Back only minimizes; the room keeps running in ChatService.
         if (chatService != null && chatService.hasRoom()) {
             moveTaskToBack(true);
@@ -505,6 +520,7 @@ public final class MainActivity extends Activity implements ChatService.UiListen
         if (chatService == null || !chatService.hasRoom()) {
             return;
         }
+        closeSidebar(true);
         dismissDialog();
         openDialog = new AlertDialog.Builder(this)
                 .setTitle("Leave the room?")
@@ -566,14 +582,15 @@ public final class MainActivity extends Activity implements ChatService.UiListen
                 showScreen(roomScreen);
                 rebuildMessages();
             }
-            roomTitleText.setText(state.title + (state.host ? "  (you are the host)" : ""));
-            membersText.setText("People (" + state.members.size() + "/" + (RoomProtocol.MAX_MEMBERS + 1)
-                    + "): " + join(state.members));
+            roomTitleText.setText(state.title);
+            peopleButton.setText("People (" + state.members.size() + ")");
+            renderSidebar(state);
             boolean canSend = state.phase == RoomState.Phase.ACTIVE;
             sendButton.setEnabled(canSend);
             messageInput.setEnabled(canSend);
             updateTimeLeft();
         } else if (state.joining()) {
+            closeSidebar(false);
             showScreen(waitingScreen);
             waitingTitleText.setText(state.title);
             waitingStateText.setText(state.phase == RoomState.Phase.WAITING_APPROVAL
@@ -581,6 +598,7 @@ public final class MainActivity extends Activity implements ChatService.UiListen
                     + (RoomProtocol.APPROVAL_TIMEOUT_MS / 1000) + " seconds)..."
                     : "Connecting to the host...");
         } else {
+            closeSidebar(false);
             if (wasInRoom || forceRebuild || lobbyScreen.getVisibility() != View.VISIBLE) {
                 showScreen(lobbyScreen);
                 messagesContainer.removeAllViews();
@@ -674,6 +692,77 @@ public final class MainActivity extends Activity implements ChatService.UiListen
             left = "Reconnecting...  " + left;
         }
         timeLeftText.setText(left);
+        sidebarTimeText.setText(left);
+    }
+
+    // ---- Side panel -----------------------------------------------------------------------------
+
+    private void openSidebar() {
+        if (sidebarOpen || !shownState.inRoom()) {
+            return;
+        }
+        sidebarOpen = true;
+        renderSidebar(shownState);
+        sidebarScrim.setVisibility(View.VISIBLE);
+        sidebar.setVisibility(View.VISIBLE);
+        sidebar.setTranslationX(sidebarWidth);
+        sidebar.animate().translationX(0f).setDuration(200L).start();
+    }
+
+    private void closeSidebar(boolean animate) {
+        if (!sidebarOpen) {
+            return;
+        }
+        sidebarOpen = false;
+        sidebarScrim.setVisibility(View.GONE);
+        sidebar.animate().cancel();
+        if (animate) {
+            sidebar.animate().translationX(sidebarWidth).setDuration(200L).withEndAction(new Runnable() {
+                @Override
+                public void run() {
+                    if (!sidebarOpen) {
+                        sidebar.setVisibility(View.GONE);
+                    }
+                }
+            }).start();
+        } else {
+            sidebar.setVisibility(View.GONE);
+        }
+    }
+
+    /** Fills the side panel: room title, time left and one row per member. */
+    private void renderSidebar(RoomState state) {
+        sidebarTitleText.setText(state.title);
+        sidebarCountText.setText("People (" + state.members.size() + "/" + (RoomProtocol.MAX_MEMBERS + 1) + ")");
+        sidebarMembers.removeAllViews();
+        for (String line : state.members) {
+            boolean host = line.endsWith(" (host)");
+            boolean reconnecting = line.endsWith(" (reconnecting)");
+            String name = host ? line.substring(0, line.length() - " (host)".length())
+                    : reconnecting ? line.substring(0, line.length() - " (reconnecting)".length())
+                    : line;
+            StringBuilder tags = new StringBuilder();
+            if (host) {
+                tags.append("host");
+            }
+            if (state.isMe(line)) {
+                tags.append(tags.length() > 0 ? ", " : "").append("you");
+            }
+            if (reconnecting) {
+                tags.append(tags.length() > 0 ? ", " : "").append("reconnecting...");
+            }
+
+            TextView row = new TextView(this);
+            row.setText((reconnecting ? "\u25CB  " : "\u25CF  ") + name
+                    + (tags.length() > 0 ? "\n     " + tags : ""));
+            row.setTextSize(15f);
+            row.setTextColor(reconnecting ? Color.rgb(140, 150, 148) : Color.rgb(24, 35, 34));
+            if (state.isMe(line)) {
+                row.setTypeface(Typeface.DEFAULT_BOLD);
+            }
+            row.setPadding(0, dp(8), 0, dp(8));
+            sidebarMembers.addView(row, matchWrap());
+        }
     }
 
     private void appendEntry(ChatService.ChatEntry entry) {
@@ -783,7 +872,80 @@ public final class MainActivity extends Activity implements ChatService.UiListen
         root.addView(roomScreen, weighted());
         waitingScreen.setVisibility(View.GONE);
         roomScreen.setVisibility(View.GONE);
-        return root;
+
+        contentFrame = new FrameLayout(this);
+        contentFrame.addView(root, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+
+        sidebarScrim = new View(this);
+        sidebarScrim.setBackgroundColor(Color.argb(110, 0, 0, 0));
+        sidebarScrim.setVisibility(View.GONE);
+        sidebarScrim.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                closeSidebar(true);
+            }
+        });
+        contentFrame.addView(sidebarScrim, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+
+        int screenWidth = getResources().getDisplayMetrics().widthPixels;
+        sidebarWidth = Math.min(Math.round(screenWidth * 0.8f), dp(300));
+        sidebar = buildSidebar();
+        sidebar.setVisibility(View.GONE);
+        contentFrame.addView(sidebar, new FrameLayout.LayoutParams(
+                sidebarWidth, FrameLayout.LayoutParams.MATCH_PARENT, Gravity.RIGHT));
+        return contentFrame;
+    }
+
+    private LinearLayout buildSidebar() {
+        LinearLayout panel = new LinearLayout(this);
+        panel.setOrientation(LinearLayout.VERTICAL);
+        panel.setBackgroundColor(Color.WHITE);
+        panel.setPadding(dp(16), dp(18), dp(16), dp(12));
+        // Swallow taps so they do not fall through to the scrim or the chat.
+        panel.setClickable(true);
+
+        sidebarTitleText = new TextView(this);
+        sidebarTitleText.setTextSize(18f);
+        sidebarTitleText.setTypeface(Typeface.DEFAULT_BOLD);
+        sidebarTitleText.setTextColor(Color.rgb(24, 35, 34));
+        panel.addView(sidebarTitleText, matchWrap());
+
+        sidebarTimeText = new TextView(this);
+        sidebarTimeText.setTextSize(14f);
+        sidebarTimeText.setTextColor(Color.rgb(0, 105, 92));
+        sidebarTimeText.setPadding(0, dp(2), 0, dp(12));
+        panel.addView(sidebarTimeText, matchWrap());
+
+        sidebarCountText = new TextView(this);
+        sidebarCountText.setTextSize(13f);
+        sidebarCountText.setTypeface(Typeface.DEFAULT_BOLD);
+        sidebarCountText.setTextColor(Color.rgb(64, 78, 76));
+        panel.addView(sidebarCountText, matchWrap());
+
+        sidebarMembers = new LinearLayout(this);
+        sidebarMembers.setOrientation(LinearLayout.VERTICAL);
+        ScrollView membersScroll = new ScrollView(this);
+        membersScroll.addView(sidebarMembers);
+        panel.addView(membersScroll, weighted());
+
+        TextView leaveNote = new TextView(this);
+        leaveNote.setText("Leaving deletes the room for everyone.");
+        leaveNote.setTextSize(12f);
+        leaveNote.setTextColor(Color.rgb(120, 60, 60));
+        leaveNote.setPadding(0, dp(8), 0, dp(4));
+        panel.addView(leaveNote, matchWrap());
+
+        Button leave = button("Leave room", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                confirmLeave();
+            }
+        });
+        leave.setTextColor(Color.rgb(176, 32, 32));
+        panel.addView(leave, matchWrap());
+        return panel;
     }
 
     private LinearLayout buildLobbyScreen() {
@@ -934,12 +1096,13 @@ public final class MainActivity extends Activity implements ChatService.UiListen
         roomTitleText.setTypeface(Typeface.DEFAULT_BOLD);
         roomTitleText.setTextColor(Color.rgb(24, 35, 34));
         header.addView(roomTitleText, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
-        header.addView(button("Leave", new View.OnClickListener() {
+        peopleButton = button("People", new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                confirmLeave();
+                openSidebar();
             }
-        }));
+        });
+        header.addView(peopleButton);
         screen.addView(header, matchWrap());
 
         timeLeftText = new TextView(this);
@@ -947,11 +1110,6 @@ public final class MainActivity extends Activity implements ChatService.UiListen
         timeLeftText.setTypeface(Typeface.DEFAULT_BOLD);
         timeLeftText.setTextColor(Color.rgb(0, 105, 92));
         screen.addView(timeLeftText);
-
-        membersText = new TextView(this);
-        membersText.setTextSize(13f);
-        membersText.setTextColor(Color.rgb(64, 78, 76));
-        screen.addView(membersText);
 
         messagesContainer = new LinearLayout(this);
         messagesContainer.setOrientation(LinearLayout.VERTICAL);
@@ -1082,10 +1240,6 @@ public final class MainActivity extends Activity implements ChatService.UiListen
 
     private int dp(int value) {
         return Math.round(value * getResources().getDisplayMetrics().density);
-    }
-
-    private static String join(List<String> values) {
-        return join(values, ", ");
     }
 
     private static String join(List<String> values, String separator) {

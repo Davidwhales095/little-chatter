@@ -22,8 +22,8 @@ A short-range messenger for older Android smartphones.
 2. **Host:** pick a time limit and tap `Create`. Allow the "make discoverable" prompt.
 3. **Members:** tap `Find rooms`; rooms appear as they are found (the scan runs up to 30 seconds). Tap a room.
 4. The member's screen shows their device name, address ending and model. The host gets a `Join request` popup with the same details, compares them, and taps `Accept` or `Decline`.
-5. Chat. The room screen shows the time left and who is in the room.
-6. `Leave` asks for confirmation, because leaving deletes the room for everyone. Back only minimizes the app.
+5. Chat. The room screen shows the time left; tap `People` to open the side panel with everyone in the room (host, you, and anyone reconnecting).
+6. `Leave room` is in the side panel and asks for confirmation, because leaving deletes the room for everyone. Back closes the panel, otherwise it only minimizes the app.
 
 ## How Rooms Work
 

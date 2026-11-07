@@ -545,7 +545,7 @@ final class RoomHost implements RoomSession, BluetoothLink.Callback {
     }
 
     private void publishState() {
-        state = new RoomState(RoomState.Phase.ACTIVE, true, title, endsAtElapsed, memberLines(), headRequest());
+        state = new RoomState(RoomState.Phase.ACTIVE, true, title, endsAtElapsed, memberLines(), headRequest(), hostNick);
         listener.onStateChanged(state);
         broadcast(infoPacket(), null);
     }
