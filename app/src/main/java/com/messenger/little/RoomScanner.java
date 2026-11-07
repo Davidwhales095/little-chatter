@@ -1,6 +1,5 @@
 package com.messenger.little;
 
-import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothClass;
 import android.bluetooth.BluetoothDevice;
 import android.bluetooth.BluetoothSocket;
@@ -11,28 +10,25 @@ import org.json.JSONObject;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ScheduledFuture;
-import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
+import java.util.Locale;
 
 /**
- * Finds rooms among discovered Bluetooth devices.
+ * Checks one Bluetooth device at a time for a room.
  *
- * Each device is tried in turn with a short RFCOMM connection to the room service UUID.
- * Devices that are not hosting a room fail quickly (their service lookup finds nothing);
- * hosts answer a "hello {probe}" with a "room" description and hang up. Devices are probed
- * one at a time, because parallel connects are unreliable on Android 4.4.
+ * A short RFCOMM connection to the room service UUID is tried. Devices that are not hosting
+ * a room fail quickly (their service lookup finds nothing); hosts answer a "hello {probe}"
+ * with a "room" description and hang up. The caller pauses discovery during a probe,
+ * because connecting while discovering is unreliable on Android 4.4.
  */
 final class RoomScanner {
-    interface Callback {
-        /** Called on the scanner thread. */
-        void onRoomFound(FoundRoom room);
-
-        /** Called on the scanner thread when every device has been tried (or after cancel). */
-        void onScanFinished(int roomsFound, boolean cancelled);
+    interface ProbeCallback {
+        /**
+         * Called on the probe thread once per {@link #probe} call.
+         *
+         * @param room   the room, or null if the device is not hosting one
+         * @param detail short result for the scan log, e.g. "room found", "no room"
+         */
+        void onProbeResult(BluetoothDevice device, FoundRoom room, String detail);
     }
 
     static final class FoundRoom {
@@ -65,6 +61,9 @@ final class RoomScanner {
     /** Bluetooth "Computer / Tablet" device class (0x011C); Android 4.4 has no constant for it. */
     private static final int DEVICE_COMPUTER_TABLET = 0x011C;
 
+    /** Per-device limit for connecting and reading the room description. */
+    private static final long PROBE_DEVICE_TIMEOUT_MS = 8000L;
+
     /**
      * Only smartphones and tablets can host a room, so only they are probed. Headsets,
      * speakers, cars, laptops, desktops and devices with an unknown class are skipped.
@@ -83,64 +82,58 @@ final class RoomScanner {
                 || deviceClass == DEVICE_COMPUTER_TABLET;
     }
 
-    /** Per-device limit for connecting and reading the room description. */
-    private static final long PROBE_DEVICE_TIMEOUT_MS = 8000L;
+    /** Device class for the scan log, e.g. "class 0x020C", or "unknown class". */
+    static String describeClass(BluetoothClass bluetoothClass) {
+        return bluetoothClass == null
+                ? "unknown class"
+                : String.format(Locale.US, "class 0x%04X", bluetoothClass.getDeviceClass());
+    }
 
-    private final BluetoothAdapter adapter;
-    private final Callback callback;
-    private final ScheduledExecutorService watchdog = Executors.newSingleThreadScheduledExecutor();
     private volatile boolean cancelled = false;
     private volatile BluetoothSocket currentSocket;
 
-    RoomScanner(BluetoothAdapter adapter, Callback callback) {
-        this.adapter = adapter;
-        this.callback = callback;
-    }
-
-    void start(final List<BluetoothDevice> candidates) {
-        final List<BluetoothDevice> devices = new ArrayList<BluetoothDevice>(candidates);
+    /** Checks one device on a background thread and reports the result to the callback. */
+    void probe(final BluetoothDevice device, final ProbeCallback callback) {
         new Thread(new Runnable() {
             @Override
             public void run() {
-                try {
-                    adapter.cancelDiscovery();
-                } catch (Exception ignored) {
-                }
-                int found = 0;
-                for (BluetoothDevice device : devices) {
-                    if (cancelled) {
-                        break;
-                    }
-                    FoundRoom room = probe(device);
-                    if (room != null && !cancelled) {
-                        found++;
-                        callback.onRoomFound(room);
-                    }
-                }
-                watchdog.shutdownNow();
-                callback.onScanFinished(found, cancelled);
+                probeNow(device, callback);
             }
-        }, "LittleChatterRoomScanner").start();
+        }, "LittleChatterRoomProbe").start();
     }
 
+    /** Aborts the probe in progress; its result is still reported (as cancelled). */
     void cancel() {
         cancelled = true;
         closeQuietly(currentSocket);
     }
 
-    private FoundRoom probe(BluetoothDevice device) {
+    private void probeNow(BluetoothDevice device, ProbeCallback callback) {
+        final boolean[] timedOut = {false};
         BluetoothSocket socket = null;
-        ScheduledFuture<?> timeout = null;
+        Thread watchdog = null;
+        FoundRoom room = null;
+        String detail;
         try {
             socket = device.createInsecureRfcommSocketToServiceRecord(RoomProtocol.SERVICE_UUID);
             currentSocket = socket;
+            if (cancelled) {
+                throw new IOException("cancelled");
+            }
             final BluetoothSocket guarded = socket;
-            timeout = watchdog.schedule(new Runnable() {
+            watchdog = new Thread(new Runnable() {
                 @Override
                 public void run() {
-                    closeQuietly(guarded);
+                    try {
+                        Thread.sleep(PROBE_DEVICE_TIMEOUT_MS);
+                        timedOut[0] = true;
+                        closeQuietly(guarded);
+                    } catch (InterruptedException finishedInTime) {
+                        // Probe ended before the time limit.
+                    }
                 }
-            }, PROBE_DEVICE_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+            }, "LittleChatterProbeWatchdog");
+            watchdog.start();
 
             // Fails within a few seconds if the device is not hosting a room.
             socket.connect();
@@ -155,30 +148,43 @@ final class RoomScanner {
             DataInputStream input = new DataInputStream(socket.getInputStream());
             int length = input.readInt();
             if (length <= 0 || length > RoomProtocol.MAX_FRAME_BYTES) {
-                return null;
+                throw new IOException("bad reply");
             }
             byte[] frame = new byte[length];
             input.readFully(frame);
             JSONObject reply = new JSONObject(new String(frame, RoomProtocol.UTF_8));
-            if (!RoomProtocol.ROOM.equals(reply.optString("t"))) {
-                return null;
+            if (RoomProtocol.ROOM.equals(reply.optString("t"))) {
+                String name = device.getName();
+                room = new FoundRoom(device,
+                        name == null || name.trim().length() == 0 ? "Unknown device" : name,
+                        RoomProtocol.cleanNickname(reply.optString("hostNick")),
+                        reply.optInt("people", 1),
+                        reply.optInt("max", RoomProtocol.MAX_MEMBERS + 1),
+                        SystemClock.elapsedRealtime() + reply.optLong("endsInMs", 0L));
+                detail = "room found";
+            } else if (RoomProtocol.REJECT.equals(reply.optString("t"))) {
+                detail = "no room (" + reply.optString("reason", "rejected") + ")";
+            } else {
+                detail = "no room (unexpected reply)";
             }
-            String name = device.getName();
-            return new FoundRoom(device,
-                    name == null || name.trim().length() == 0 ? "Unknown device" : name,
-                    RoomProtocol.cleanNickname(reply.optString("hostNick")),
-                    reply.optInt("people", 1),
-                    reply.optInt("max", RoomProtocol.MAX_MEMBERS + 1),
-                    SystemClock.elapsedRealtime() + reply.optLong("endsInMs", 0L));
-        } catch (Exception notARoom) {
-            return null;
+        } catch (Exception error) {
+            if (cancelled) {
+                detail = "cancelled";
+            } else if (timedOut[0]) {
+                detail = "no answer within " + (PROBE_DEVICE_TIMEOUT_MS / 1000) + " s";
+            } else {
+                String message = error.getMessage();
+                // A device that does not run a room fails the service lookup.
+                detail = "no room" + (message == null ? "" : " (" + message + ")");
+            }
         } finally {
-            if (timeout != null) {
-                timeout.cancel(false);
+            if (watchdog != null) {
+                watchdog.interrupt();
             }
             closeQuietly(socket);
             currentSocket = null;
         }
+        callback.onProbeResult(device, room, detail);
     }
 
     private static void closeQuietly(BluetoothSocket socket) {

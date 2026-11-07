@@ -36,24 +36,28 @@ import android.widget.TextView;
 
 import java.util.ArrayList;
 import java.util.HashSet;
-import java.util.LinkedHashMap;
+import java.util.LinkedList;
 import java.util.List;
 import java.util.Locale;
-import java.util.Map;
 import java.util.Set;
 
-public final class MainActivity extends Activity implements ChatService.UiListener, RoomScanner.Callback {
+public final class MainActivity extends Activity implements ChatService.UiListener {
     private static final int REQUEST_ENABLE_BLUETOOTH = 3001;
     /** Android 4.4 allows at most one hour of discoverability per request. */
     private static final int MAX_DISCOVERABLE_SECONDS = 3600;
     private static final int[] ROOM_MINUTES = {10, 30, 60};
     private static final int DEFAULT_ROOM_MINUTES_INDEX = 1;
+    /** "Find rooms" stops after this long, even if discovery keeps finding devices. */
+    private static final long FIND_ROOMS_MS = 30000L;
+    private static final int MAX_SCAN_LOG_LINES = 8;
 
     private final Handler handler = new Handler();
-    /** Devices seen during the current "Find rooms" scan, by address. */
-    private final Map<String, BluetoothDevice> discovered = new LinkedHashMap<String, BluetoothDevice>();
-    /** Addresses of non-phone/tablet devices seen and skipped during the current scan. */
-    private final Set<String> skipped = new HashSet<String>();
+    /** Addresses already handled (checked, queued or skipped) in the current "Find rooms" scan. */
+    private final Set<String> seenAddresses = new HashSet<String>();
+    /** Phones and tablets found but not checked yet, in the order they were found. */
+    private final LinkedList<BluetoothDevice> probeQueue = new LinkedList<BluetoothDevice>();
+    /** Per-device results of the current scan, newest last, shown under the room list. */
+    private final LinkedList<String> scanLog = new LinkedList<String>();
     private final List<RoomScanner.FoundRoom> rooms = new ArrayList<RoomScanner.FoundRoom>();
 
     private BluetoothAdapter bluetoothAdapter;
@@ -63,6 +67,14 @@ public final class MainActivity extends Activity implements ChatService.UiListen
     private RoomState shownState = RoomState.IDLE;
     private ArrayAdapter<RoomScanner.FoundRoom> roomAdapter;
     private boolean findingRooms = false;
+    /** A device is being checked right now (discovery is paused meanwhile). */
+    private boolean probing = false;
+    /** Discovery was cancelled by us for a check, so its "finished" event is not the end of a round. */
+    private boolean pausedForProbe = false;
+    private boolean pairedQueued = false;
+    /** Incremented per scan so results from a stopped scan are ignored. */
+    private int scanSession = 0;
+    private long findDeadline;
     private RoomScanner scanner;
     private AlertDialog openDialog;
     private AlertDialog requestDialog;
@@ -80,6 +92,7 @@ public final class MainActivity extends Activity implements ChatService.UiListen
     private EditText nicknameInput;
     private RadioGroup durationGroup;
     private Button findButton;
+    private TextView scanLogText;
     private TextView waitingTitleText;
     private TextView waitingStateText;
     private TextView waitingDeviceText;
@@ -106,6 +119,16 @@ public final class MainActivity extends Activity implements ChatService.UiListen
         }
     };
 
+    private final Runnable findTimeout = new Runnable() {
+        @Override
+        public void run() {
+            // A check in progress finishes first; probeNext() then sees the deadline.
+            if (findingRooms && !probing) {
+                finishFindingRooms();
+            }
+        }
+    };
+
     private final Runnable countdownTick = new Runnable() {
         @Override
         public void run() {
@@ -122,13 +145,17 @@ public final class MainActivity extends Activity implements ChatService.UiListen
                 BluetoothDevice device = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
                 if (device != null && findingRooms) {
                     BluetoothClass bluetoothClass = intent.getParcelableExtra(BluetoothDevice.EXTRA_CLASS);
-                    addCandidate(device, bluetoothClass != null ? bluetoothClass : device.getBluetoothClass());
-                    setStatus("Looking for nearby phones and tablets... (" + discovered.size() + " found)");
+                    onDeviceFound(device, bluetoothClass != null ? bluetoothClass : device.getBluetoothClass());
                 }
             } else if (BluetoothAdapter.ACTION_DISCOVERY_FINISHED.equals(action)) {
-                if (findingRooms && scanner == null) {
-                    checkDevicesForRooms();
+                if (!findingRooms) {
+                    return;
                 }
+                if (pausedForProbe) {
+                    pausedForProbe = false; // We paused it for a check; it resumes afterwards.
+                    return;
+                }
+                onDiscoveryRoundFinished();
             }
         }
     };
@@ -255,36 +282,6 @@ public final class MainActivity extends Activity implements ChatService.UiListen
         showClosedDialog(wasInRoom ? "The room is gone" : "Could not join", reason);
     }
 
-    // ---- RoomScanner.Callback (scanner thread) ----------------------------------------------
-
-    @Override
-    public void onRoomFound(final RoomScanner.FoundRoom room) {
-        runOnUiThread(new Runnable() {
-            @Override
-            public void run() {
-                rooms.add(room);
-                roomAdapter.notifyDataSetChanged();
-            }
-        });
-    }
-
-    @Override
-    public void onScanFinished(final int roomsFound, final boolean cancelled) {
-        runOnUiThread(new Runnable() {
-            @Override
-            public void run() {
-                scanner = null;
-                findingRooms = false;
-                findButton.setText("Find rooms");
-                if (!cancelled) {
-                    setStatus(roomsFound == 0
-                            ? "No rooms found. Ask the host to tap Create and allow their phone to be visible."
-                            : "Found " + roomsFound + (roomsFound == 1 ? " room" : " rooms") + ". Tap one to ask to join.");
-                }
-            }
-        });
-    }
-
     // ---- Actions --------------------------------------------------------------------------------
 
     private void createRoom() {
@@ -304,6 +301,10 @@ public final class MainActivity extends Activity implements ChatService.UiListen
         startActivity(intent);
     }
 
+    // "Find rooms": phones and tablets are checked as soon as discovery finds them. Discovery
+    // pauses during each check (connecting while discovering is unreliable on Android 4.4) and
+    // resumes afterwards, so rooms show up in the list while the scan is still running.
+
     private void toggleFindRooms() {
         if (findingRooms) {
             stopFindingRooms();
@@ -315,49 +316,135 @@ public final class MainActivity extends Activity implements ChatService.UiListen
         }
         rooms.clear();
         roomAdapter.notifyDataSetChanged();
-        discovered.clear();
-        skipped.clear();
-        // Paired phones and tablets are checked too, in case the host is no longer discoverable.
-        for (BluetoothDevice device : bluetoothAdapter.getBondedDevices()) {
-            addCandidate(device, device.getBluetoothClass());
-        }
+        probeQueue.clear();
+        seenAddresses.clear();
+        scanLog.clear();
+        renderScanLog();
+        scanSession++;
+        probing = false;
+        pausedForProbe = false;
+        pairedQueued = false;
         findingRooms = true;
+        findDeadline = SystemClock.elapsedRealtime() + FIND_ROOMS_MS;
+        handler.removeCallbacks(findTimeout);
+        handler.postDelayed(findTimeout, FIND_ROOMS_MS);
         findButton.setText("Stop");
-        if (bluetoothAdapter.isDiscovering()) {
-            bluetoothAdapter.cancelDiscovery();
-        }
-        if (bluetoothAdapter.startDiscovery()) {
-            setStatus("Looking for nearby devices (about 12 seconds)...");
-        } else {
-            checkDevicesForRooms();
-        }
+        resumeDiscovery();
     }
 
-    /** Second step of "Find rooms": ask every device found whether it is hosting a room. */
-    private void checkDevicesForRooms() {
-        if (discovered.isEmpty()) {
-            onScanFinished(0, false);
+    private void onDeviceFound(BluetoothDevice device, BluetoothClass bluetoothClass) {
+        if (!seenAddresses.add(device.getAddress())) {
             return;
         }
-        setStatus("Checking " + discovered.size() + " phones/tablets for rooms"
-                + (skipped.isEmpty() ? "" : " (skipped " + skipped.size() + " other devices)") + "...");
-        scanner = new RoomScanner(bluetoothAdapter, this);
-        scanner.start(new ArrayList<BluetoothDevice>(discovered.values()));
+        if (!RoomScanner.isPhoneOrTablet(bluetoothClass)) {
+            log(label(device) + ": skipped, not a phone/tablet (" + RoomScanner.describeClass(bluetoothClass) + ")");
+            return;
+        }
+        probeQueue.addLast(device);
+        probeNext();
     }
 
-    /** Keeps smartphones and tablets for the room check; other kinds of devices are skipped. */
-    private void addCandidate(BluetoothDevice device, BluetoothClass bluetoothClass) {
-        String address = device.getAddress();
-        if (RoomScanner.isPhoneOrTablet(bluetoothClass)) {
-            discovered.put(address, device);
-            skipped.remove(address);
-        } else if (!discovered.containsKey(address)) {
-            skipped.add(address);
+    /** Checks the next queued device, or resumes discovery when nothing is queued. */
+    private void probeNext() {
+        if (!findingRooms || probing) {
+            return;
         }
+        if (SystemClock.elapsedRealtime() >= findDeadline) {
+            finishFindingRooms();
+            return;
+        }
+        BluetoothDevice device = probeQueue.pollFirst();
+        if (device == null) {
+            resumeDiscovery();
+            return;
+        }
+        probing = true;
+        if (bluetoothAdapter.isDiscovering()) {
+            pausedForProbe = true;
+            bluetoothAdapter.cancelDiscovery();
+        }
+        setStatus("Checking " + label(device) + " for a room...");
+        final int session = scanSession;
+        scanner = new RoomScanner();
+        scanner.probe(device, new RoomScanner.ProbeCallback() {
+            @Override
+            public void onProbeResult(final BluetoothDevice checked, final RoomScanner.FoundRoom room,
+                                      final String detail) {
+                runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        onProbeDone(session, checked, room, detail);
+                    }
+                });
+            }
+        });
+    }
+
+    private void onProbeDone(int session, BluetoothDevice device, RoomScanner.FoundRoom room, String detail) {
+        if (session != scanSession) {
+            return; // Result of a scan that was stopped.
+        }
+        probing = false;
+        scanner = null;
+        log(label(device) + ": " + detail);
+        if (room != null) {
+            rooms.add(room);
+            roomAdapter.notifyDataSetChanged();
+        }
+        probeNext();
+    }
+
+    private void resumeDiscovery() {
+        if (!findingRooms || probing || bluetoothAdapter.isDiscovering()) {
+            return;
+        }
+        if (SystemClock.elapsedRealtime() >= findDeadline) {
+            finishFindingRooms();
+            return;
+        }
+        if (bluetoothAdapter.startDiscovery()) {
+            setStatus("Looking for nearby phones and tablets... (" + rooms.size()
+                    + (rooms.size() == 1 ? " room" : " rooms") + " so far)");
+        } else {
+            onDiscoveryRoundFinished();
+        }
+    }
+
+    /** A full discovery round ended without new phones or tablets to check. */
+    private void onDiscoveryRoundFinished() {
+        if (probing) {
+            return;
+        }
+        if (!pairedQueued) {
+            // Paired phones and tablets are checked too, in case the host is no longer discoverable.
+            pairedQueued = true;
+            for (BluetoothDevice device : bluetoothAdapter.getBondedDevices()) {
+                if (RoomScanner.isPhoneOrTablet(device.getBluetoothClass()) && seenAddresses.add(device.getAddress())) {
+                    probeQueue.addLast(device);
+                }
+            }
+            if (!probeQueue.isEmpty()) {
+                probeNext();
+                return;
+            }
+        }
+        finishFindingRooms();
+    }
+
+    private void finishFindingRooms() {
+        stopFindingRooms();
+        setStatus(rooms.isEmpty()
+                ? "No rooms found. Ask the host to tap Create and allow their phone to be visible."
+                : "Found " + rooms.size() + (rooms.size() == 1 ? " room" : " rooms") + ". Tap one to ask to join.");
     }
 
     private void stopFindingRooms() {
         findingRooms = false;
+        scanSession++;
+        probing = false;
+        pausedForProbe = false;
+        probeQueue.clear();
+        handler.removeCallbacks(findTimeout);
         if (findButton != null) {
             findButton.setText("Find rooms");
         }
@@ -371,6 +458,28 @@ public final class MainActivity extends Activity implements ChatService.UiListen
             }
         } catch (Exception ignored) {
         }
+    }
+
+    private void log(String line) {
+        scanLog.addLast(line);
+        while (scanLog.size() > MAX_SCAN_LOG_LINES) {
+            scanLog.removeFirst();
+        }
+        renderScanLog();
+    }
+
+    private void renderScanLog() {
+        if (scanLogText == null) {
+            return;
+        }
+        scanLogText.setVisibility(scanLog.isEmpty() ? View.GONE : View.VISIBLE);
+        scanLogText.setText(join(scanLog, "\n"));
+    }
+
+    private static String label(BluetoothDevice device) {
+        String name = device.getName();
+        return (name == null || name.trim().length() == 0 ? "Unknown device" : name)
+                + " (" + RoomProtocol.addressTail(device.getAddress()) + ")";
     }
 
     private void askToJoin(RoomScanner.FoundRoom room) {
@@ -746,6 +855,15 @@ public final class MainActivity extends Activity implements ChatService.UiListen
         });
         screen.addView(roomList, weighted());
 
+        scanLogText = new TextView(this);
+        scanLogText.setTextSize(11f);
+        scanLogText.setTypeface(Typeface.MONOSPACE);
+        scanLogText.setTextColor(Color.rgb(80, 91, 89));
+        scanLogText.setBackgroundColor(Color.WHITE);
+        scanLogText.setPadding(dp(6), dp(4), dp(6), dp(4));
+        scanLogText.setVisibility(View.GONE);
+        screen.addView(scanLogText, matchWrap());
+
         TextView hint = new TextView(this);
         hint.setText("Host: pick a time and tap Create. Others: tap Find rooms, then tap a room to ask "
                 + "to join. The host accepts each person. Up to " + (RoomProtocol.MAX_MEMBERS + 1) + " people.");
@@ -967,10 +1085,14 @@ public final class MainActivity extends Activity implements ChatService.UiListen
     }
 
     private static String join(List<String> values) {
+        return join(values, ", ");
+    }
+
+    private static String join(List<String> values, String separator) {
         StringBuilder builder = new StringBuilder();
         for (String value : values) {
             if (builder.length() > 0) {
-                builder.append(", ");
+                builder.append(separator);
             }
             builder.append(value);
         }
